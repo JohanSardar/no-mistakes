@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 )
 
@@ -171,6 +172,9 @@ func ParseWorkerProvenance(raw string) (*WorkerProvenance, error) {
 	dec.UseNumber()
 	if err := dec.Decode(&p); err != nil {
 		return nil, fmt.Errorf("parse worker provenance: %w", err)
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, fmt.Errorf("parse worker provenance: trailing data after the JSON object")
 	}
 	p.Normalize()
 	if p.IsEmpty() {

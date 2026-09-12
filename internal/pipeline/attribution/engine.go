@@ -1,6 +1,7 @@
 package attribution
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -202,14 +203,21 @@ type locator struct {
 	head          string
 	submitted     string
 	defaultBranch string
-	// reviewHeads are the commits review rounds examined, in round order.
-	// When a rebase rewrote the submitted head before review, the first of
-	// these that is an ancestor of a finding's commit stands in for it.
-	reviewHeads []string
-	anchors     map[string]*anchor
-	diffs       map[string]map[string]map[int]struct{}
-	unavailable string
-	gaps        []string
+	// rerun means submitted is the gate head a rerun picked up, which may
+	// already carry an earlier run's pipeline commits: lines the branch
+	// introduced before it cannot be split between the worker and that
+	// pipeline, so they stay unknown instead of being named the worker's.
+	rerun bool
+	// firstReviewHead is the commit the first review round examined. When the
+	// Rebase step rewrote the submitted head before review, it stands in for
+	// the submission; a later rewrite (a CI merge-conflict repair restarting
+	// review) has no such stand-in and locations after it are unknown.
+	firstReviewHead string
+	anchors         map[string]*anchor
+	diffs           map[string]map[string]map[int]struct{}
+	blobs           map[string]int
+	unavailable     string
+	gaps            []string
 }
 
 type anchor struct {
@@ -220,9 +228,12 @@ type anchor struct {
 }
 
 func newLocator(ctx context.Context, in Input) *locator {
-	l := &locator{ctx: ctx, dir: strings.TrimSpace(in.WorkDir), anchors: map[string]*anchor{}, diffs: map[string]map[string]map[int]struct{}{}}
+	l := &locator{ctx: ctx, dir: strings.TrimSpace(in.WorkDir), anchors: map[string]*anchor{}, diffs: map[string]map[string]map[int]struct{}{}, blobs: map[string]int{}}
 	if in.Repo != nil {
 		l.defaultBranch = strings.TrimSpace(in.Repo.DefaultBranch)
+	}
+	if in.Run != nil {
+		l.rerun = in.Run.Rerun
 	}
 	if l.dir == "" {
 		l.unavailable = "worktree path is missing; git location is unknown"
@@ -257,9 +268,11 @@ func newLocator(ctx context.Context, in Input) *locator {
 				continue
 			}
 			if sha := strings.TrimSpace(deref(round.ReviewedHeadSHA)); sha != "" {
-				l.reviewHeads = append(l.reviewHeads, sha)
+				l.firstReviewHead = sha
+				break
 			}
 		}
+		break
 	}
 	return l
 }
@@ -305,9 +318,41 @@ func (l *locator) attribute(cf classifiedFinding) (bucket, confidence string, ev
 		return types.AttributionUnknown, types.AttributionConfidenceUnknown, []string{fmt.Sprintf("could not diff %s..%s", short(a.base), short(locate))}
 	}
 	if lineAddedIn(branchAdded, file, line) {
+		if l.rerun {
+			gap := fmt.Sprintf("rerun submitted the gate head %s, which may carry an earlier run's pipeline commits; lines it already had cannot be split between the worker and that pipeline", short(l.submitted))
+			l.gaps = appendUnique(l.gaps, gap)
+			return types.AttributionUnknown, types.AttributionConfidenceUnknown, []string{fmt.Sprintf("line %s:%d at %s was on the branch before the rerun; %s", file, line, short(locate), gap)}
+		}
 		return types.AttributionOriginalWorker, confidence, []string{fmt.Sprintf("line %s:%d at %s was added by the submitted change (%s..%s)", file, line, short(locate), short(a.base), short(a.workerHead))}
 	}
+	lines, present := l.blobLines(locate, file)
+	switch {
+	case !present:
+		return types.AttributionUnknown, types.AttributionConfidenceUnknown, []string{fmt.Sprintf("file %s is not present at %s; git location is unknown", file, short(locate))}
+	case line > lines:
+		return types.AttributionUnknown, types.AttributionConfidenceUnknown, []string{fmt.Sprintf("line %s:%d is beyond the end of the file at %s (%d lines); git location is unknown", file, line, short(locate), lines)}
+	}
 	return types.AttributionPreExisting, types.AttributionConfidenceMedium, []string{fmt.Sprintf("line %s:%d at %s predates the branch base %s", file, line, short(locate), short(a.base))}
+}
+
+// blobLines reports whether file exists at commit sha and how many lines it
+// has there. A location the tree does not hold is not evidence of anything.
+func (l *locator) blobLines(sha, file string) (int, bool) {
+	key := sha + ":" + file
+	if n, ok := l.blobs[key]; ok {
+		return n, n >= 0
+	}
+	out, err := git.RunRaw(l.ctx, l.dir, "cat-file", "blob", key)
+	if err != nil {
+		l.blobs[key] = -1
+		return 0, false
+	}
+	n := bytes.Count(out, []byte("\n"))
+	if len(out) > 0 && out[len(out)-1] != '\n' {
+		n++
+	}
+	l.blobs[key] = n
+	return n, true
 }
 
 func (l *locator) anchorFor(locate string) *anchor {
@@ -319,13 +364,8 @@ func (l *locator) anchorFor(locate string) *anchor {
 	switch {
 	case isAncestor(l.ctx, l.dir, l.submitted, locate):
 		a.workerHead = l.submitted
-	default:
-		for _, sha := range l.reviewHeads {
-			if isAncestor(l.ctx, l.dir, sha, locate) {
-				a.workerHead, a.rewritten = sha, true
-				break
-			}
-		}
+	case l.firstReviewHead != "" && isAncestor(l.ctx, l.dir, l.firstReviewHead, locate):
+		a.workerHead, a.rewritten = l.firstReviewHead, true
 	}
 	if a.workerHead == "" {
 		a.err = fmt.Sprintf("submitted head is not an ancestor of %s after a history rewrite; git location is unknown", short(locate))

@@ -429,15 +429,22 @@ func jsonRawIfAny(s string) json.RawMessage {
 	return json.RawMessage(s)
 }
 
+// validateWorkerProvenance returns the canonical encoding of the supplied
+// worker identity, which is what the daemon stores; an object naming nothing
+// is the same as no flag.
 func validateWorkerProvenance(raw string) (string, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return "", nil
-	}
-	if _, err := types.ParseWorkerProvenance(raw); err != nil {
+	parsed, err := types.ParseWorkerProvenance(raw)
+	if err != nil {
 		return "", err
 	}
-	return raw, nil
+	if parsed == nil {
+		return "", nil
+	}
+	encoded, err := json.Marshal(parsed)
+	if err != nil {
+		return "", fmt.Errorf("encode worker provenance: %w", err)
+	}
+	return string(encoded), nil
 }
 
 func formatSkipPushOptions(steps []types.StepName) []string {

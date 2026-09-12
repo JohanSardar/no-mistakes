@@ -959,6 +959,120 @@ func TestSnapshot_RebasedBranchUsesFirstReviewedHeadAsWorkerAnchor(t *testing.T)
 	}
 }
 
+// A review that restarted after a mid-run rewrite (a CI merge-conflict repair
+// rebased the branch) examined a head the submission is no longer an ancestor
+// of. Only the head the first review round examined may stand in for the
+// submission; a later round's head would count the pipeline's own commits as
+// the worker's.
+func TestSnapshot_MidRunRewriteHasNoWorkerStandIn(t *testing.T) {
+	dir, _, submitted, pipelineHead := repoWithWorkerBugAndPipelineFix(t)
+	gitCmd(t, dir, "checkout", "main")
+	commitFile(t, dir, "upstream.go", "package base\nfunc upstream() {}\n", "main moved")
+	gitCmd(t, dir, "checkout", "feature")
+	gitCmd(t, dir, "rebase", "main")
+	rebased := gitCmd(t, dir, "rev-parse", "HEAD")
+	head := commitFile(t, dir, "handler.go", "package handler\nfunc worker() {}\nfunc pipelineFix() { fixed() }\n", "second repair")
+	in := fixtureInput(t, dir, submitted, head)
+	review := insertStep(t, in, types.StepReview, types.StepStatusCompleted)
+	insertRound(t, in, review, 1, "initial", findingsJSON(types.Finding{ID: "review-1", Severity: types.FindingSeverityError, File: "handler.go", Line: 2, Description: "nil deref", Action: types.ActionAutoFix}), submitted, true, false)
+	insertRound(t, in, review, 2, "auto_fix", "", pipelineHead, false, true)
+	insertRound(t, in, review, 3, "initial", findingsJSON(types.Finding{ID: "review-1", Severity: types.FindingSeverityError, File: "handler.go", Line: 3, Description: "pipelineFix panics", Action: types.ActionAutoFix}), rebased, true, false)
+	insertRound(t, in, review, 4, "auto_fix", "", head, false, true)
+
+	rec, err := Snapshot(context.Background(), in.Input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byDesc := bugsByDescription(rec)
+	if got := byDesc["nil deref"]; got.Attribution != types.AttributionOriginalWorker || got.Confidence != types.AttributionConfidenceHigh {
+		t.Fatalf("worker bug located before the rewrite = %+v", got)
+	}
+	if got := byDesc["pipelineFix panics"]; got.Attribution != types.AttributionUnknown {
+		t.Fatalf("pipeline line after the rewrite was attributed: %+v gaps=%v", got, rec.EvidenceGaps)
+	}
+	if !containsGap(rec, "not an ancestor") || containsGap(rec, "rewritten before review") {
+		t.Fatalf("gaps = %v", rec.EvidenceGaps)
+	}
+	if rec.Status == types.AttributionStatusComplete {
+		t.Fatal("a mid-run rewrite must not be a complete score")
+	}
+}
+
+// A finding in a file the located commit does not hold (the Test step's own
+// uncommitted test file, a path the agent misreported) is not in any diff,
+// which is not evidence that the code predates the branch.
+func TestSnapshot_FindingInAFileAbsentAtItsCommitIsUnknown(t *testing.T) {
+	dir, _, submitted, head := repoWithWorkerBugAndPipelineFix(t)
+	write(t, dir, "handler_test.go", "package handler\nfunc TestWorker() {\n\tworker()\n}\n")
+	in := fixtureInput(t, dir, submitted, head)
+	test := insertStep(t, in, types.StepTest, types.StepStatusCompleted)
+	insertRound(t, in, test, 1, "initial", testedFindingsJSON(head, types.Finding{ID: "test-1", Severity: types.FindingSeverityError, File: "handler_test.go", Line: 3, Description: "test never asserts", Action: types.ActionAutoFix}), "", true, false)
+	insertRound(t, in, test, 2, "auto_fix", "", "", false, true)
+
+	rec, err := Snapshot(context.Background(), in.Input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Counts.PreExisting != 0 || rec.Counts.Unknown != 1 || rec.Bugs[0].Attribution != types.AttributionUnknown {
+		t.Fatalf("absent file was attributed: %+v %+v", rec.Counts, rec.Bugs)
+	}
+	if !strings.Contains(strings.Join(rec.Bugs[0].Evidence, "\n"), "not present at") {
+		t.Fatalf("evidence = %v", rec.Bugs[0].Evidence)
+	}
+}
+
+// A line past the end of the file at the located commit names nothing.
+func TestSnapshot_FindingBeyondTheEndOfItsFileIsUnknown(t *testing.T) {
+	dir, _, submitted, head := repoWithWorkerBugAndPipelineFix(t)
+	in := fixtureInput(t, dir, submitted, head)
+	seedReviewFinding(t, in, "base.go", 40, "pre() overflows", types.ActionAutoFix, true, submitted)
+
+	rec, err := Snapshot(context.Background(), in.Input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Counts.PreExisting != 0 || rec.Counts.Unknown != 1 || rec.Bugs[0].Attribution != types.AttributionUnknown {
+		t.Fatalf("out-of-range line was attributed: %+v %+v", rec.Counts, rec.Bugs)
+	}
+	if !strings.Contains(strings.Join(rec.Bugs[0].Evidence, "\n"), "beyond the end of the file") {
+		t.Fatalf("evidence = %v", rec.Bugs[0].Evidence)
+	}
+}
+
+// A rerun submits the gate head, which may already carry an earlier run's
+// pipeline commits; the lines it brought cannot be split between the worker
+// and that pipeline. This run's own pipeline lines and pre-existing code are
+// still provable.
+func TestSnapshot_RerunGateHeadLinesAreUnknownNotWorker(t *testing.T) {
+	dir, _, submitted, head := repoWithWorkerBugAndPipelineFix(t)
+	in := fixtureInput(t, dir, submitted, head)
+	in.Run.Rerun = true
+	review := insertStep(t, in, types.StepReview, types.StepStatusCompleted)
+	insertRound(t, in, review, 1, "initial", findingsJSON(
+		types.Finding{ID: "review-1", Severity: types.FindingSeverityError, File: "handler.go", Line: 2, Description: "nil deref", Action: types.ActionAutoFix},
+		types.Finding{ID: "review-2", Severity: types.FindingSeverityError, File: "handler.go", Line: 3, Description: "pipeline panic", Action: types.ActionAutoFix},
+		types.Finding{ID: "review-3", Severity: types.FindingSeverityError, File: "base.go", Line: 2, Description: "pre-existing off-by-one", Action: types.ActionAutoFix},
+	), head, false, false)
+
+	rec, err := Snapshot(context.Background(), in.Input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Counts.OriginalWorker != 0 || rec.Counts.Unknown != 1 || rec.Counts.Pipeline != 1 || rec.Counts.PreExisting != 1 {
+		t.Fatalf("counts = %+v bugs=%+v", rec.Counts, rec.Bugs)
+	}
+	byDesc := bugsByDescription(rec)
+	if got := byDesc["nil deref"]; got.Attribution != types.AttributionUnknown || got.Confidence != types.AttributionConfidenceUnknown {
+		t.Fatalf("gate-head line was claimed for the worker: %+v", got)
+	}
+	if !containsGap(rec, "rerun submitted the gate head") {
+		t.Fatalf("gaps = %v", rec.EvidenceGaps)
+	}
+	if rec.Status == types.AttributionStatusComplete {
+		t.Fatal("a rerun cannot be a complete worker score")
+	}
+}
+
 func TestSkippedRecordIsNotClean(t *testing.T) {
 	dir, _, submitted, head := repoWithWorkerBugAndPipelineFix(t)
 	in := fixtureInput(t, dir, submitted, head)

@@ -46,6 +46,15 @@ func TestParseWorkerProvenance_RejectsInvalidJSON(t *testing.T) {
 	}
 }
 
+func TestParseWorkerProvenance_RejectsTrailingData(t *testing.T) {
+	for _, raw := range []string{`{"tool":"codex"} x`, `{"tool":"codex"} {"tool":"grok"}`, `{"tool":"codex"}}`} {
+		p, err := ParseWorkerProvenance(raw)
+		if err == nil {
+			t.Fatalf("%q parsed as %+v", raw, p)
+		}
+	}
+}
+
 func TestParseWorkerProvenance_DropsNonObjectSettings(t *testing.T) {
 	p, err := ParseWorkerProvenance(`{"tool":"codex","settings":"not-an-object"}`)
 	if err != nil {

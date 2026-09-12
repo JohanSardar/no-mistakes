@@ -1252,7 +1252,7 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		trackStartFailure("create_run")
 		return "", fmt.Errorf("create run: %w", err)
 	}
-	if err := m.applyLaunchAttribution(run, attr); err != nil {
+	if err := m.applyLaunchAttribution(run, attr, trigger == "rerun"); err != nil {
 		m.db.UpdateRunError(run.ID, err.Error())
 		trackStartFailure("launch_attribution")
 		return "", err
@@ -1892,8 +1892,8 @@ func (m *RunManager) validateFixesRun(repo *db.Repo, attr types.LaunchAttributio
 	return nil
 }
 
-func (m *RunManager) applyLaunchAttribution(run *db.Run, attr types.LaunchAttribution) error {
-	if attr.IsEmpty() {
+func (m *RunManager) applyLaunchAttribution(run *db.Run, attr types.LaunchAttribution, rerun bool) error {
+	if attr.IsEmpty() && !rerun {
 		return nil
 	}
 	workerJSON := ""
@@ -1904,9 +1904,10 @@ func (m *RunManager) applyLaunchAttribution(run *db.Run, attr types.LaunchAttrib
 		}
 		workerJSON = string(raw)
 	}
-	if err := m.db.SetRunLaunchAttribution(run.ID, workerJSON, attr.FixesRunID); err != nil {
+	if err := m.db.SetRunLaunchAttribution(run.ID, workerJSON, attr.FixesRunID, rerun); err != nil {
 		return err
 	}
+	run.Rerun = rerun
 	if workerJSON != "" {
 		run.WorkerProvenanceJSON = &workerJSON
 	}

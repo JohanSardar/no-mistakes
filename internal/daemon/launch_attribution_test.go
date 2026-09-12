@@ -128,6 +128,9 @@ func TestLaunchAttributionIsRecordedAndInheritedByRerun(t *testing.T) {
 	if inherited.WorkerProvenanceJSON != nil {
 		t.Fatalf("rerun re-asserted the earlier worker identity over the gate head: %v", *inherited.WorkerProvenanceJSON)
 	}
+	if fixRun.Rerun || !inherited.Rerun {
+		t.Fatalf("rerun marker: pushed run %v, rerun %v", fixRun.Rerun, inherited.Rerun)
+	}
 
 	// An explicit value on the rerun is recorded as supplied.
 	var override ipc.RerunResult
@@ -142,6 +145,9 @@ func TestLaunchAttributionIsRecordedAndInheritedByRerun(t *testing.T) {
 	}
 	if overridden.FixesRunID == nil || *overridden.FixesRunID != original.ID {
 		t.Fatalf("explicit worker override dropped the inherited fixes_run_id: %v", overridden.FixesRunID)
+	}
+	if !overridden.Rerun {
+		t.Fatal("an explicit worker override cleared the rerun marker")
 	}
 }
 
