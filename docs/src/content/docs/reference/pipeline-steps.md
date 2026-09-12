@@ -6,7 +6,7 @@ description: Reference for each step in the validation pipeline.
 This is the per-step reference. For the overview and rationale, see [Pipeline](/no-mistakes/concepts/pipeline/). For the fix loop, see [Auto-Fix Loop](/no-mistakes/concepts/auto-fix/).
 
 ```text
-intent → rebase → review → test → document → lint → push → pr → ci
+intent → rebase → review → test → document → attribution → lint → push → pr → ci
 ```
 
 Each step can produce findings, request approval, trigger auto-fix, or apply safe fixes during its own pass. Steps that encounter fatal errors stop the pipeline. Steps can also be pre-skipped when starting a run, skipped by the user, or skipped automatically by the pipeline.
@@ -184,6 +184,24 @@ Updates matching documentation for code changes and reports only unresolved gaps
 **Auto-fix:** documentation fixes happen during the initial document pass. Unresolved findings pause for approval instead of starting another automatic document/fix loop. If you manually trigger a fix from the TUI or AXI interface, the agent receives the selected previous findings plus any per-finding user notes, any selected user-authored findings, and the shared [finding decision history](#finding-decision-history).
 
 **Default auto-fix limit:** not used for automatic document follow-up loops.
+
+## Attribution
+
+Observational record of who introduced confirmed bugs. It runs after Documentation (and any document-anchored repository gates) and before Lint. It does not park, auto-fix, or restart the pipeline: review fixes are already re-reviewed.
+
+**Behavior:**
+
+- At run entry, records the submitted Git commit plus any caller-supplied worker identity (`axi run --worker-provenance` or `NO_MISTAKES_WORKER_PROVENANCE`) and the typed bug-fix signal (`--fixes-run <run-id>`). Missing fields stay `unknown`; values are stored only when supplied or independently verified.
+- After Documentation is accepted, diffs the submitted head against the current head and attributes **confirmed** review/test findings (and findings a fix round actually selected) to `original_worker`, `pipeline`, `pre_existing`, or `unknown`.
+- A changed line is not a bug. Git blame, last author, and the mere existence of a diff are not used as causation.
+- Documentation, lint/style, refactor, and unanswered ask-user design findings are recorded as non-bugs and are not counted in bug buckets.
+- Repeat findings are deduplicated. Skipped or failed review/test/document steps, missing submitted SHA, and rewritten history that is no longer ancestral are `partial` or `unavailable`, never a clean zero score.
+- The pre-Lint snapshot is retained. Lint, CI, and later pipeline commits are reconciled into a final record without rewriting the snapshot. A later run that names `--fixes-run` repeats the same engine at finalization and links to the originating run; it does not rewrite that run's historical evidence.
+- Results appear on `axi status` under `attribution:` and in the attribution step's pipeline summary. Limits of the record are included in the payload.
+
+**Approval:** none.
+
+**Auto-fix:** none.
 
 ## Lint
 

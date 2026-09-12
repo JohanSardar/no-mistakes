@@ -204,6 +204,7 @@ func TestPostReviewStepsRefuseHeadClobberAtEntry(t *testing.T) {
 	postReviewSteps := []pipeline.Step{
 		&TestStep{},
 		&DocumentStep{},
+		&AttributionStep{},
 		&LintStep{},
 		&PushStep{},
 		&PRStep{},
@@ -276,6 +277,7 @@ func TestPostReviewStepsRefuseUnverifiableRecordedHeadAtEntry(t *testing.T) {
 	postReviewSteps := []pipeline.Step{
 		&TestStep{},
 		&DocumentStep{},
+		&AttributionStep{},
 		&LintStep{},
 		&PushStep{},
 		&PRStep{},

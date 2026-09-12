@@ -1,0 +1,90 @@
+package db
+
+import (
+	"testing"
+
+	"github.com/kunchenguid/no-mistakes/internal/types"
+)
+
+func TestRunInsertHasNoAttribution(t *testing.T) {
+	d := openTestDB(t)
+	repo, _ := d.InsertRepo("/home/user/project", "git@github.com:user/project.git", "main")
+	run, err := d.InsertRun(repo.ID, "feature", "abc123", "def456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.GetRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.WorkerProvenanceJSON != nil || got.FixesRunID != nil || got.AttributionSnapshotJSON != nil || got.AttributionJSON != nil {
+		t.Fatalf("legacy insert grew attribution fields: %+v", got)
+	}
+}
+
+func TestSetRunLaunchAttributionAndFixesRunJoin(t *testing.T) {
+	d := openTestDB(t)
+	repo, _ := d.InsertRepo("/home/user/project", "git@github.com:user/project.git", "main")
+	original, err := d.InsertRun(repo.ID, "feature", "aaa", "bbb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fix, err := d.InsertRun(repo.ID, "hotfix", "ccc", "ddd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetRunLaunchAttribution(fix.ID, `{"tool":"grok","model":"grok-4.6"}`, original.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.GetRun(fix.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.WorkerProvenanceJSON == nil || *got.WorkerProvenanceJSON != `{"tool":"grok","model":"grok-4.6"}` {
+		t.Fatalf("worker provenance = %v", got.WorkerProvenanceJSON)
+	}
+	if got.FixesRunID == nil || *got.FixesRunID != original.ID {
+		t.Fatalf("fixes_run_id = %v", got.FixesRunID)
+	}
+	linked, err := d.GetRunsByFixesRunID(repo.ID, original.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(linked) != 1 || linked[0].ID != fix.ID {
+		t.Fatalf("later corrections = %+v", linked)
+	}
+	// Originating run is unchanged.
+	orig, err := d.GetRun(original.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if orig.FixesRunID != nil || orig.AttributionJSON != nil {
+		t.Fatalf("originating run was rewritten: %+v", orig)
+	}
+}
+
+func TestAttributionSnapshotIsNotRewrittenByFinal(t *testing.T) {
+	d := openTestDB(t)
+	repo, _ := d.InsertRepo("/home/user/project", "git@github.com:user/project.git", "main")
+	run, err := d.InsertRun(repo.ID, "feature", "abc", "def")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetRunAttributionSnapshot(run.ID, `{"phase":"snapshot","status":"complete"}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetRunAttributionFinal(run.ID, `{"phase":"final","status":"complete","reconciled":true}`); err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.GetRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AttributionSnapshotJSON == nil || *got.AttributionSnapshotJSON != `{"phase":"snapshot","status":"complete"}` {
+		t.Fatalf("snapshot rewritten: %v", got.AttributionSnapshotJSON)
+	}
+	if got.AttributionJSON == nil || *got.AttributionJSON != `{"phase":"final","status":"complete","reconciled":true}` {
+		t.Fatalf("final = %v", got.AttributionJSON)
+	}
+	_ = types.AttributionPhaseSnapshot
+}

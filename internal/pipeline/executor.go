@@ -22,6 +22,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
+	"github.com/kunchenguid/no-mistakes/internal/pipeline/attribution"
 	"github.com/kunchenguid/no-mistakes/internal/safeurl"
 	"github.com/kunchenguid/no-mistakes/internal/telemetry"
 	"github.com/kunchenguid/no-mistakes/internal/types"
@@ -1500,6 +1501,9 @@ func (e *Executor) failRun(run *db.Run, repo *db.Repo, err error, ctxs ...contex
 	}
 	run.Status = runStatus
 	run.Error = &errMsg
+	if recErr := attribution.ReconcileRun(context.Background(), e.db, run, repo, e.workDir); recErr != nil {
+		slog.Warn("attribution reconciliation failed", "run", run.ID, "error", recErr)
+	}
 	e.emitRunEvent(ipc.EventRunCompleted, run, repo)
 	return err
 }
@@ -1519,6 +1523,9 @@ func (e *Executor) completeRun(run *db.Run, repo *db.Repo) error {
 		run.HeadSHA = verifiedHead
 	}
 	run.Status = types.RunCompleted
+	if recErr := attribution.ReconcileRun(context.Background(), e.db, run, repo, e.workDir); recErr != nil {
+		slog.Warn("attribution reconciliation failed", "run", run.ID, "error", recErr)
+	}
 	e.emitRunEvent(ipc.EventRunCompleted, run, repo)
 	return nil
 }

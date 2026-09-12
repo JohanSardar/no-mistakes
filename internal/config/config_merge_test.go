@@ -272,6 +272,7 @@ func TestAutoFixLimit(t *testing.T) {
 		{types.StepRebase, 4},
 		{types.StepPush, 0},
 		{types.StepPR, 0},
+		{types.StepAttribution, 0},
 	}
 	for _, tt := range tests {
 		got := cfg.AutoFixLimit(tt.step)

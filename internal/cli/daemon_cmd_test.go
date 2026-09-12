@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/kunchenguid/no-mistakes/internal/types"
@@ -157,5 +158,56 @@ func TestReconciledPreviousHeadPushOptionRoundTrip(t *testing.T) {
 	}
 	if _, err := parseReconciledPreviousHeadPushOptions([]string{"no-mistakes.reconciled-previous-head=refs/heads/main"}); err == nil {
 		t.Fatal("a non-SHA previous head claim was accepted")
+	}
+}
+
+func TestWorkerProvenancePushOptionRoundTrip(t *testing.T) {
+	raw := `{"tool":"grok","model":"grok-4.6","provider":"xai"}`
+	opt := formatWorkerProvenancePushOption(raw)
+	got, err := parseWorkerProvenancePushOptions([]string{"no-mistakes.skip=lint", opt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != raw {
+		t.Fatalf("got %q want %q", got, raw)
+	}
+}
+
+func TestFixesRunPushOptionRoundTrip(t *testing.T) {
+	opt := formatFixesRunPushOption("run-abc")
+	got, err := parseFixesRunPushOptions([]string{opt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "run-abc" {
+		t.Fatalf("got %q", got)
+	}
+	if _, err := parseFixesRunPushOptions([]string{"no-mistakes.fixes-run=a", "no-mistakes.fixes-run=b"}); err == nil {
+		t.Fatal("conflicting fixes-run options were accepted")
+	}
+}
+
+func TestLoadWorkerProvenanceInput_EnvAndFile(t *testing.T) {
+	t.Setenv("NO_MISTAKES_WORKER_PROVENANCE", `{"tool":"codex"}`)
+	got, err := loadWorkerProvenanceInput("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != `{"tool":"codex"}` {
+		t.Fatalf("env provenance = %q", got)
+	}
+	path := t.TempDir() + "/prov.json"
+	if err := os.WriteFile(path, []byte(`{"tool":"grok","model":"grok-4.6"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err = loadWorkerProvenanceInput("@" + path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, `"tool":"grok"`) {
+		t.Fatalf("file provenance = %q", got)
+	}
+	if _, err := loadWorkerProvenanceInput("{"); err == nil {
+		t.Fatal("invalid JSON was accepted")
 	}
 }

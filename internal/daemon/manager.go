@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -782,14 +783,18 @@ func (m *RunManager) HandlePushReceived(ctx context.Context, params *ipc.PushRec
 	if git.IsZeroSHA(baseSHA) && gate.ArchivedHeadRecorded(ctx, m.paths.RepoDir(repo.ID), branch, params.ReconciledPreviousHead) {
 		baseSHA = strings.TrimSpace(params.ReconciledPreviousHead)
 	}
+	attr, err := launchAttributionFrom(params.WorkerProvenance, params.FixesRunID)
+	if err != nil {
+		return "", err
+	}
 	if params.LaunchNonce != "" {
-		receipt, err := m.startFreshLaunch(ctx, repo, branch, params.New, baseSHA, params.Gate, params.SkipSteps, params.Intent, params.LaunchNonce, params.ValidationGeneration, params.PRBaseBranch, "push")
+		receipt, err := m.startFreshLaunch(ctx, repo, branch, params.New, baseSHA, params.Gate, params.SkipSteps, params.Intent, params.LaunchNonce, params.ValidationGeneration, params.PRBaseBranch, "push", attr)
 		if err != nil {
 			return "", err
 		}
 		return receipt.RunID, nil
 	}
-	return m.startRun(ctx, repo, branch, params.New, baseSHA, "push", params.SkipSteps, params.Intent, params.PRBaseBranch)
+	return m.startRun(ctx, repo, branch, params.New, baseSHA, "push", params.SkipSteps, params.Intent, params.PRBaseBranch, attr)
 }
 
 // HandleStartFreshRun creates or replays a proof-mode launch only after
@@ -802,13 +807,17 @@ func (m *RunManager) HandleStartFreshRun(ctx context.Context, params *ipc.StartF
 	if repo == nil {
 		return ipc.LaunchReceipt{}, fmt.Errorf("unknown repo %s", params.RepoID)
 	}
-	return m.startFreshLaunch(ctx, repo, params.Branch, params.HeadSHA, "", m.paths.RepoDir(repo.ID), params.SkipSteps, params.Intent, params.LaunchNonce, params.ValidationGeneration, params.PRBaseBranch, "fresh")
+	attr, err := launchAttributionFrom(params.WorkerProvenance, params.FixesRunID)
+	if err != nil {
+		return ipc.LaunchReceipt{}, err
+	}
+	return m.startFreshLaunch(ctx, repo, params.Branch, params.HeadSHA, "", m.paths.RepoDir(repo.ID), params.SkipSteps, params.Intent, params.LaunchNonce, params.ValidationGeneration, params.PRBaseBranch, "fresh", attr)
 }
 
 // startFreshLaunch owns proof identity under the branch lock. A nonce may
 // replay only its immutable submitted-head, generation, and persisted-intent
 // digest. It must never fall back to ordinary same-head reattachment.
-func (m *RunManager) startFreshLaunch(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, gateDir string, skipSteps []types.StepName, intent, launchNonce, validationGeneration, prBaseBranch, trigger string) (ipc.LaunchReceipt, error) {
+func (m *RunManager) startFreshLaunch(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, gateDir string, skipSteps []types.StepName, intent, launchNonce, validationGeneration, prBaseBranch, trigger string, attr types.LaunchAttribution) (ipc.LaunchReceipt, error) {
 	if err := validateLaunchNonce(launchNonce); err != nil {
 		return ipc.LaunchReceipt{}, err
 	}
@@ -890,7 +899,7 @@ func (m *RunManager) startFreshLaunch(ctx context.Context, repo *db.Repo, branch
 				inheritedPRURL = inheritablePRURL(runs[0])
 			}
 		}
-		runID, err := m.startRunWithIntentSourceLocked(ctx, repo, branch, headSHA, baseSHA, trigger, skipSteps, persistedIntent, db.RunIntentSourceAgent, launchNonce, validationGeneration, requestDigest, storedPRBaseBranch, inheritedPRURL)
+		runID, err := m.startRunWithIntentSourceLocked(ctx, repo, branch, headSHA, baseSHA, trigger, skipSteps, persistedIntent, db.RunIntentSourceAgent, launchNonce, validationGeneration, requestDigest, storedPRBaseBranch, inheritedPRURL, attr)
 		if err != nil {
 			return "", err
 		}
@@ -1008,7 +1017,7 @@ func receiptForRun(run *db.Run, created bool) (ipc.LaunchReceipt, error) {
 // retarget can prove it is moving the same still-open review object.
 // A supplied clean caller head must match the selected head before any run
 // starts or is superseded. It never changes head selection.
-func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch, previousRunID string, skipSteps []types.StepName, intent, prBaseBranch, callerHeadSHA string) (string, error) {
+func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch, previousRunID string, skipSteps []types.StepName, intent, prBaseBranch, callerHeadSHA string, attr types.LaunchAttribution) (string, error) {
 	repo, err := m.db.GetRepo(repoID)
 	if err != nil {
 		return "", fmt.Errorf("get repo: %w", err)
@@ -1085,7 +1094,8 @@ func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch, previousRu
 	if storedPRBaseBranch == "" && selectedRun.PRBaseBranch != nil {
 		storedPRBaseBranch = strings.TrimSpace(*selectedRun.PRBaseBranch)
 	}
-	return m.startRunWithIntentSource(ctx, repo, branch, headSHA, baseSHA, "rerun", skipSteps, intent, intentSource, storedPRBaseBranch, inheritablePRURL(selectedRun))
+	attr = inheritLaunchAttribution(attr, selectedRun)
+	return m.startRunWithIntentSource(ctx, repo, branch, headSHA, baseSHA, "rerun", skipSteps, intent, intentSource, storedPRBaseBranch, inheritablePRURL(selectedRun), attr)
 }
 
 func inheritablePRURL(run *db.Run) string {
@@ -1160,16 +1170,16 @@ func fetchRunDefaultBranch(ctx context.Context, workDir string, repo *db.Repo) e
 // startRun creates a run, sets up a worktree, and launches pipeline execution.
 // A non-empty intent is stamped onto the run as agent-supplied, so the intent
 // step uses it instead of inferring from transcripts.
-func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent, prBaseBranch string) (string, error) {
-	return m.startRunWithIntentSource(ctx, repo, branch, headSHA, baseSHA, trigger, skipSteps, intent, db.RunIntentSourceAgent, prBaseBranch, "")
+func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent, prBaseBranch string, attr types.LaunchAttribution) (string, error) {
+	return m.startRunWithIntentSource(ctx, repo, branch, headSHA, baseSHA, trigger, skipSteps, intent, db.RunIntentSourceAgent, prBaseBranch, "", attr)
 }
 
 // startRunWithIntentSource is the common run-creation path. source is empty
 // when no intent is supplied, RunIntentSourceAgent for a new explicit
 // override, and RunIntentSourceRerun for inherited explicit intent.
-func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent, source, prBaseBranch, inheritedPRURL string) (string, error) {
+func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent, source, prBaseBranch, inheritedPRURL string, attr types.LaunchAttribution) (string, error) {
 	return m.withBranchLock(repo.ID, branch, func() (string, error) {
-		return m.startRunWithIntentSourceLocked(ctx, repo, branch, headSHA, baseSHA, trigger, skipSteps, intent, source, "", "", "", prBaseBranch, inheritedPRURL)
+		return m.startRunWithIntentSourceLocked(ctx, repo, branch, headSHA, baseSHA, trigger, skipSteps, intent, source, "", "", "", prBaseBranch, inheritedPRURL, attr)
 	})
 }
 
@@ -1184,7 +1194,7 @@ func (m *RunManager) withBranchLock(repoID, branch string, action func() (string
 
 // startRunWithIntentSourceLocked performs run creation while the caller owns
 // the repository/branch lock. Proof fields are empty for ordinary launches.
-func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent, source, launchNonce, validationGeneration, intentDigest, prBaseBranch, inheritedPRURL string) (string, error) {
+func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent, source, launchNonce, validationGeneration, intentDigest, prBaseBranch, inheritedPRURL string, attr types.LaunchAttribution) (string, error) {
 	branchRole := telemetryBranchRole(branch, repo.DefaultBranch)
 	trackStartFailure := func(stage string) {
 		telemetry.Track("run", telemetry.Fields{
@@ -1235,6 +1245,11 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 	if err != nil {
 		trackStartFailure("create_run")
 		return "", fmt.Errorf("create run: %w", err)
+	}
+	if err := m.applyLaunchAttribution(repo, run, attr); err != nil {
+		m.db.UpdateRunError(run.ID, err.Error())
+		trackStartFailure("launch_attribution")
+		return "", err
 	}
 	if inherited := strings.TrimSpace(inheritedPRURL); inherited != "" {
 		if err := m.db.UpdateRunPRURL(run.ID, inherited); err != nil {
@@ -1821,4 +1836,78 @@ func (m *RunManager) cancelActiveRuns(repoID, branch string) {
 			return
 		}
 	}
+}
+
+func launchAttributionFrom(worker json.RawMessage, fixesRunID string) (types.LaunchAttribution, error) {
+	attr := types.LaunchAttribution{FixesRunID: strings.TrimSpace(fixesRunID)}
+	if len(bytesTrim(worker)) == 0 {
+		attr.Normalize()
+		return attr, nil
+	}
+	parsed, err := types.ParseWorkerProvenance(string(worker))
+	if err != nil {
+		return types.LaunchAttribution{}, err
+	}
+	attr.Worker = parsed
+	attr.Normalize()
+	return attr, nil
+}
+
+func bytesTrim(raw json.RawMessage) []byte {
+	return []byte(strings.TrimSpace(string(raw)))
+}
+
+func inheritLaunchAttribution(attr types.LaunchAttribution, selected *db.Run) types.LaunchAttribution {
+	if selected == nil {
+		return attr
+	}
+	if strings.TrimSpace(attr.FixesRunID) == "" && selected.FixesRunID != nil {
+		attr.FixesRunID = strings.TrimSpace(*selected.FixesRunID)
+	}
+	if attr.Worker == nil && selected.WorkerProvenanceJSON != nil {
+		parsed, err := types.ParseWorkerProvenance(*selected.WorkerProvenanceJSON)
+		if err == nil {
+			attr.Worker = parsed
+		}
+	}
+	attr.Normalize()
+	return attr
+}
+
+func (m *RunManager) applyLaunchAttribution(repo *db.Repo, run *db.Run, attr types.LaunchAttribution) error {
+	attr.Normalize()
+	if attr.IsEmpty() {
+		return nil
+	}
+	if attr.FixesRunID != "" {
+		origin, err := m.db.GetRun(attr.FixesRunID)
+		if err != nil {
+			return fmt.Errorf("lookup fixes-run: %w", err)
+		}
+		if origin == nil || origin.RepoID != repo.ID {
+			return fmt.Errorf("fixes-run %q is not a run in this repository", attr.FixesRunID)
+		}
+		if origin.ID == run.ID {
+			return fmt.Errorf("fixes-run cannot name the run being created")
+		}
+	}
+	workerJSON := ""
+	if attr.Worker != nil {
+		raw, err := json.Marshal(attr.Worker)
+		if err != nil {
+			return fmt.Errorf("encode worker provenance: %w", err)
+		}
+		workerJSON = string(raw)
+	}
+	if err := m.db.SetRunLaunchAttribution(run.ID, workerJSON, attr.FixesRunID); err != nil {
+		return err
+	}
+	if workerJSON != "" {
+		run.WorkerProvenanceJSON = &workerJSON
+	}
+	if attr.FixesRunID != "" {
+		id := attr.FixesRunID
+		run.FixesRunID = &id
+	}
+	return nil
 }

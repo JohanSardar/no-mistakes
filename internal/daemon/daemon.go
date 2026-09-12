@@ -1290,7 +1290,11 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, fmt.Errorf("invalid params: %w", err)
 		}
-		runID, err := mgr.HandleRerun(ctx, p.RepoID, p.Branch, p.PreviousRunID, p.SkipSteps, p.Intent, p.PRBaseBranch, p.CallerHeadSHA)
+		attr, attrErr := launchAttributionFrom(p.WorkerProvenance, p.FixesRunID)
+		if attrErr != nil {
+			return nil, attrErr
+		}
+		runID, err := mgr.HandleRerun(ctx, p.RepoID, p.Branch, p.PreviousRunID, p.SkipSteps, p.Intent, p.PRBaseBranch, p.CallerHeadSHA, attr)
 		if err != nil {
 			return nil, err
 		}
@@ -1415,22 +1419,26 @@ func gateContextResult(result gatecontext.Result) ipc.GateContextResult {
 
 func runToInfo(d *db.DB, r *db.Run, steps []*db.StepResult) *ipc.RunInfo {
 	info := &ipc.RunInfo{
-		ID:                 r.ID,
-		RepoID:             r.RepoID,
-		Branch:             r.Branch,
-		HeadSHA:            r.HeadSHA,
-		SubmittedHeadSHA:   r.SubmittedHeadSHA,
-		BaseSHA:            r.BaseSHA,
-		Status:             r.Status,
-		PRURL:              r.PRURL,
-		Error:              r.Error,
-		CIReady:            r.CIReadyAt != nil,
-		CIReadyNoCI:        r.CIReadyNoCI,
-		PRBaseBranch:       r.PRBaseBranch,
-		AwaitingAgent:      r.AwaitingAgentSince != nil,
-		AwaitingAgentSince: r.AwaitingAgentSince,
-		CreatedAt:          r.CreatedAt,
-		UpdatedAt:          r.UpdatedAt,
+		ID:                      r.ID,
+		RepoID:                  r.RepoID,
+		Branch:                  r.Branch,
+		HeadSHA:                 r.HeadSHA,
+		SubmittedHeadSHA:        r.SubmittedHeadSHA,
+		BaseSHA:                 r.BaseSHA,
+		Status:                  r.Status,
+		PRURL:                   r.PRURL,
+		Error:                   r.Error,
+		CIReady:                 r.CIReadyAt != nil,
+		CIReadyNoCI:             r.CIReadyNoCI,
+		PRBaseBranch:            r.PRBaseBranch,
+		WorkerProvenanceJSON:    r.WorkerProvenanceJSON,
+		FixesRunID:              r.FixesRunID,
+		AttributionJSON:         r.AttributionJSON,
+		AttributionSnapshotJSON: r.AttributionSnapshotJSON,
+		AwaitingAgent:           r.AwaitingAgentSince != nil,
+		AwaitingAgentSince:      r.AwaitingAgentSince,
+		CreatedAt:               r.CreatedAt,
+		UpdatedAt:               r.UpdatedAt,
 	}
 	if len(steps) > 0 {
 		info.Steps = make([]ipc.StepResultInfo, 0, len(steps))

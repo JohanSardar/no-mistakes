@@ -119,6 +119,8 @@ func newAxiRunCmd() *cobra.Command {
 	var launchNonce string
 	var validationGeneration string
 	var baseBranch string
+	var workerProvenance string
+	var fixesRunID string
 	var wait time.Duration
 
 	cmd := &cobra.Command{
@@ -163,9 +165,9 @@ func newAxiRunCmd() *cobra.Command {
 				skipSteps, err := parseSkipSteps(skipValue)
 				if err != nil {
 					return emitError(cmd, 2, err.Error(),
-						"Valid steps: intent, rebase, review, test, document, lint, push, pr, ci")
+						"Valid steps: intent, rebase, review, test, document, attribution, lint, push, pr, ci")
 				}
-				return runAxiRunWithLaunchProof(cmd, autoYes, skipSteps, intent, baseBranch, launchNonce, validationGeneration, wait)
+				return runAxiRunWithLaunchProof(cmd, autoYes, skipSteps, intent, baseBranch, launchNonce, validationGeneration, wait, workerProvenance, fixesRunID)
 			})
 		},
 	}
@@ -175,15 +177,17 @@ func newAxiRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&launchNonce, "launch-nonce", "", "opaque nonce for a daemon-bound pre-drive launch receipt")
 	cmd.Flags().StringVar(&validationGeneration, "validation-generation", "", "opaque generation bound to --launch-nonce proof mode")
 	cmd.Flags().StringVar(&baseBranch, "base-branch", "", "integration branch to open the PR against for this run only (overrides pr.base_branch)")
+	cmd.Flags().StringVar(&workerProvenance, "worker-provenance", "", "JSON object of the originating worker identity (tool/model/provider/settings, optional task_id/external_run_id); prefix with @ to read a file. Unset fields stay unknown. Also accepted from NO_MISTAKES_WORKER_PROVENANCE")
+	cmd.Flags().StringVar(&fixesRunID, "fixes-run", "", "typed signal that this run is a later bug-fix of an earlier run ID in the same repository")
 	bindAxiWaitFlag(cmd, &wait)
 	return cmd
 }
 
 func runAxiRun(cmd *cobra.Command, autoYes bool, skipSteps []types.StepName, intent, baseBranch string) error {
-	return runAxiRunWithLaunchProof(cmd, autoYes, skipSteps, intent, baseBranch, "", "", defaultAxiWait)
+	return runAxiRunWithLaunchProof(cmd, autoYes, skipSteps, intent, baseBranch, "", "", defaultAxiWait, "", "")
 }
 
-func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []types.StepName, intent, baseBranch, launchNonce, validationGeneration string, wait time.Duration) error {
+func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []types.StepName, intent, baseBranch, launchNonce, validationGeneration string, wait time.Duration, workerProvenance, fixesRunID string) error {
 	if err := validateAxiWait(wait); err != nil {
 		return emitError(cmd, 2, err.Error(), "Pass a positive duration such as --wait 8m")
 	}
@@ -274,14 +278,18 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 		if guard := preflightGuard(ctx, env, branch); guard != nil {
 			return guard(cmd)
 		}
-		var err error
+		workerRaw, err := loadWorkerProvenanceInput(workerProvenance)
+		if err != nil {
+			return emitError(cmd, 2, err.Error())
+		}
+		fixesRunID = strings.TrimSpace(fixesRunID)
 		if launchNonce != "" {
-			launchReceipt, err = triggerProofRun(ctx, env, branch, headSHA, skipSteps, intent, baseBranch, launchNonce, validationGeneration)
+			launchReceipt, err = triggerProofRun(ctx, env, branch, headSHA, skipSteps, intent, baseBranch, launchNonce, validationGeneration, workerRaw, fixesRunID)
 			if err == nil {
 				runID = launchReceipt.RunID
 			}
 		} else {
-			runID, err = triggerRun(ctx, env, branch, skipSteps, intent, baseBranch)
+			runID, err = triggerRun(ctx, env, branch, skipSteps, intent, baseBranch, workerRaw, fixesRunID)
 		}
 		if err != nil {
 			if ownershipErr, ok := err.(*branchOwnershipError); ok {
@@ -505,12 +513,18 @@ func freshRunBranchOwnershipState(ctx context.Context, env *axiEnv) *branchsync.
 // the gate to trigger a pipeline, and falls back to a rerun when the push was a
 // no-op (the gate already had this commit). Callers must check for an existing
 // active run first (see activeRunID) and apply pre-flight guards.
-func triggerRun(ctx context.Context, env *axiEnv, branch string, skipSteps []types.StepName, intent, baseBranch string) (string, error) {
+func triggerRun(ctx context.Context, env *axiEnv, branch string, skipSteps []types.StepName, intent, baseBranch, workerProvenance, fixesRunID string) (string, error) {
 	pushOptions := formatSkipPushOptions(skipSteps)
 	if opt := formatIntentPushOption(intent); opt != "" {
 		pushOptions = append(pushOptions, opt)
 	}
 	if opt := formatPRBaseBranchPushOption(baseBranch); opt != "" {
+		pushOptions = append(pushOptions, opt)
+	}
+	if opt := formatWorkerProvenancePushOption(workerProvenance); opt != "" {
+		pushOptions = append(pushOptions, opt)
+	}
+	if opt := formatFixesRunPushOption(fixesRunID); opt != "" {
 		pushOptions = append(pushOptions, opt)
 	}
 	observedHead, err := git.HeadSHA(ctx, ".")
@@ -576,7 +590,7 @@ func triggerRun(ctx context.Context, env *axiEnv, branch string, skipSteps []typ
 	// No run appeared: the push was likely up-to-date. Refresh the caller's
 	// clean-head evidence because it may have changed while waiting above.
 	var rr ipc.RerunResult
-	params := rerunParams(env.repo.ID, branch, skipSteps, intent, baseBranch)
+	params := rerunParams(env.repo.ID, branch, skipSteps, intent, baseBranch, workerProvenance, fixesRunID)
 	params.CallerHeadSHA, err = rerunCallerHead(ctx)
 	if err != nil {
 		return "", err
@@ -601,7 +615,7 @@ func claimLaunchReceipt(client *ipc.Client, repoID, branch, launchNonce, submitt
 // triggerProofRun captures the immutable submitted commit and waits only for
 // the matching nonce-bound receipt. Ordinary active-run heuristics never prove
 // strict launch identity.
-func triggerProofRun(ctx context.Context, env *axiEnv, branch, headSHA string, skipSteps []types.StepName, intent, baseBranch, launchNonce, validationGeneration string) (*ipc.LaunchReceipt, error) {
+func triggerProofRun(ctx context.Context, env *axiEnv, branch, headSHA string, skipSteps []types.StepName, intent, baseBranch, launchNonce, validationGeneration, workerProvenance, fixesRunID string) (*ipc.LaunchReceipt, error) {
 	pushOptions := formatSkipPushOptions(skipSteps)
 	pushOptions = append(pushOptions,
 		formatIntentPushOption(intent),
@@ -609,6 +623,12 @@ func triggerProofRun(ctx context.Context, env *axiEnv, branch, headSHA string, s
 		formatValidationGenerationPushOption(validationGeneration),
 	)
 	if opt := formatPRBaseBranchPushOption(baseBranch); opt != "" {
+		pushOptions = append(pushOptions, opt)
+	}
+	if opt := formatWorkerProvenancePushOption(workerProvenance); opt != "" {
+		pushOptions = append(pushOptions, opt)
+	}
+	if opt := formatFixesRunPushOption(fixesRunID); opt != "" {
 		pushOptions = append(pushOptions, opt)
 	}
 	if state := freshRunBranchOwnershipState(ctx, env); state != nil {
@@ -630,6 +650,7 @@ func triggerProofRun(ctx context.Context, env *axiEnv, branch, headSHA string, s
 	if err := env.client.Call(ipc.MethodStartFreshRun, &ipc.StartFreshRunParams{
 		RepoID: env.repo.ID, Branch: branch, HeadSHA: headSHA, SkipSteps: skipSteps,
 		Intent: intent, LaunchNonce: launchNonce, ValidationGeneration: validationGeneration, PRBaseBranch: baseBranch,
+		WorkerProvenance: jsonRawIfAny(workerProvenance), FixesRunID: fixesRunID,
 	}, &result); err != nil {
 		return nil, fmt.Errorf("start fresh run: %w", err)
 	}
@@ -737,8 +758,8 @@ func activeRunLookupParams(repoID, branch string) *ipc.GetActiveRunParams {
 	return &ipc.GetActiveRunParams{RepoID: repoID, Branch: branch}
 }
 
-func rerunParams(repoID, branch string, skipSteps []types.StepName, intent, baseBranch string) *ipc.RerunParams {
-	return &ipc.RerunParams{RepoID: repoID, Branch: branch, SkipSteps: skipSteps, Intent: intent, PRBaseBranch: baseBranch}
+func rerunParams(repoID, branch string, skipSteps []types.StepName, intent, baseBranch, workerProvenance, fixesRunID string) *ipc.RerunParams {
+	return &ipc.RerunParams{RepoID: repoID, Branch: branch, SkipSteps: skipSteps, Intent: intent, PRBaseBranch: baseBranch, WorkerProvenance: jsonRawIfAny(workerProvenance), FixesRunID: fixesRunID}
 }
 
 // emitLaunchReceipt writes the proof before driveRun subscribes, so callers

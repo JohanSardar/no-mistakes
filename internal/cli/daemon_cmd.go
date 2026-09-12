@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -125,6 +126,14 @@ func newDaemonNotifyPushCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			workerProvenance, err := parseWorkerProvenancePushOptions(pushOptions)
+			if err != nil {
+				return err
+			}
+			fixesRunID, err := parseFixesRunPushOptions(pushOptions)
+			if err != nil {
+				return err
+			}
 			gatePath, err := normalizeNotifyGatePath(gate)
 			if err != nil {
 				return err
@@ -153,6 +162,8 @@ func newDaemonNotifyPushCmd() *cobra.Command {
 				ValidationGeneration:   validationGeneration,
 				PRBaseBranch:           prBaseBranch,
 				ReconciledPreviousHead: reconciledPreviousHead,
+				WorkerProvenance:       jsonRawIfAny(workerProvenance),
+				FixesRunID:             fixesRunID,
 			}, &result)
 		},
 	}
@@ -370,6 +381,77 @@ func isHexCommitSHA(value string) bool {
 		}
 	}
 	return true
+}
+
+const workerProvenancePushOptionPrefix = "no-mistakes.worker-provenance="
+const fixesRunPushOptionPrefix = "no-mistakes.fixes-run="
+
+func formatWorkerProvenancePushOption(raw string) string {
+	return formatOpaquePushOption(workerProvenancePushOptionPrefix, strings.TrimSpace(raw))
+}
+
+func formatFixesRunPushOption(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ""
+	}
+	return fixesRunPushOptionPrefix + id
+}
+
+func parseWorkerProvenancePushOptions(options []string) (string, error) {
+	return parseOpaquePushOptions(options, workerProvenancePushOptionPrefix, "worker provenance")
+}
+
+func parseFixesRunPushOptions(options []string) (string, error) {
+	id := ""
+	for _, option := range options {
+		value, ok := strings.CutPrefix(option, fixesRunPushOptionPrefix)
+		if !ok {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return "", fmt.Errorf("fixes-run push option must not be empty")
+		}
+		if id != "" && id != value {
+			return "", fmt.Errorf("conflicting fixes-run push options")
+		}
+		id = value
+	}
+	return id, nil
+}
+
+func jsonRawIfAny(s string) json.RawMessage {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	return json.RawMessage(s)
+}
+
+func loadWorkerProvenanceInput(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		raw = strings.TrimSpace(os.Getenv("NO_MISTAKES_WORKER_PROVENANCE"))
+	}
+	if raw == "" {
+		return "", nil
+	}
+	if strings.HasPrefix(raw, "@") {
+		path := strings.TrimSpace(strings.TrimPrefix(raw, "@"))
+		if path == "" {
+			return "", fmt.Errorf("worker provenance @path is empty")
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("read worker provenance: %w", err)
+		}
+		raw = string(data)
+	}
+	if _, err := types.ParseWorkerProvenance(raw); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(raw), nil
 }
 
 func formatSkipPushOptions(steps []types.StepName) []string {

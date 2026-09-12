@@ -33,7 +33,7 @@ func TestWithCustomGates_InsertsAfterAnchorAndPreservesCore(t *testing.T) {
 	}))
 	want := []string{
 		"intent", "rebase", "review", "gate.review.arch-fitness",
-		"test", "gate.test.mutation-budget", "document", "lint", "push", "pr", "ci",
+		"test", "gate.test.mutation-budget", "document", "attribution", "lint", "push", "pr", "ci",
 	}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("sequence =\n %v\nwant\n %v", got, want)
