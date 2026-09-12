@@ -11,7 +11,7 @@ intent → rebase → review → test → document → attribution → lint → 
 
 ```mermaid
 flowchart LR
-  intent["Intent"] --> rebase["Rebase"] --> review["Review"] --> test["Test"] --> document["Document"] --> lint["Lint"] --> push["Push"] --> pr["PR"] --> ci["CI"]
+  intent["Intent"] --> rebase["Rebase"] --> review["Review"] --> test["Test"] --> document["Document"] --> attribution["Attribution"] --> lint["Lint"] --> push["Push"] --> pr["PR"] --> ci["CI"]
   review -. findings .-> action["Approve / fix / skip / abort"]
   test -. findings .-> action
   document -. findings .-> action

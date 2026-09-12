@@ -86,7 +86,7 @@ func build(ctx context.Context, in Input, phase string, snapshot *types.Attribut
 				rec.EvidenceGaps = append(rec.EvidenceGaps, fmt.Sprintf("%s step %s; not treated as a clean score", step.StepName, step.Status))
 			}
 		}
-		for _, cf := range classifyStepFindings(step, in.Rounds[step.ID]) {
+		for _, cf := range classifyStepFindings(step, in.Rounds[step.ID], loc.dir) {
 			fp := fingerprint(cf.Finding)
 			if cf.Kind != types.ChangeKindBug {
 				nonBugs = append(nonBugs, types.NonBugChange{
@@ -130,9 +130,6 @@ func build(ctx context.Context, in Input, phase string, snapshot *types.Attribut
 		nonBugs = append(nonBugs, snapshot.NonBugs...)
 		rec.SnapshotHeadSHA = snapshot.SnapshotHeadSHA
 		rec.Reconciled = strings.TrimSpace(in.HeadSHA) != "" && in.HeadSHA != snapshot.SnapshotHeadSHA
-		if rec.Reconciled {
-			rec.EvidenceGaps = append(rec.EvidenceGaps, "reconciled commits after the pre-lint snapshot")
-		}
 	}
 	rec.EvidenceGaps = append(rec.EvidenceGaps, loc.gaps...)
 
@@ -157,7 +154,6 @@ func newRecord(in Input, phase string) *types.AttributionRecord {
 		SchemaVersion: types.AttributionSchemaVersion,
 		Status:        types.AttributionStatusPartial,
 		Phase:         phase,
-		Limits:        types.DefaultAttributionLimits(),
 		Bugs:          []types.AttributedBug{},
 		NonBugs:       []types.NonBugChange{},
 	}
@@ -277,11 +273,7 @@ func (l *locator) attribute(cf classifiedFinding) (bucket, confidence string, ev
 		return types.AttributionUnknown, types.AttributionConfidenceUnknown, []string{l.unavailable}
 	}
 	if filepath.IsAbs(file) {
-		rel, err := filepath.Rel(l.dir, file)
-		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return types.AttributionUnknown, types.AttributionConfidenceUnknown, []string{fmt.Sprintf("finding path %s is outside the worktree", file)}
-		}
-		file = filepath.ToSlash(rel)
+		return types.AttributionUnknown, types.AttributionConfidenceUnknown, []string{fmt.Sprintf("finding path %s is outside the worktree", file)}
 	}
 	locate := cf.LocateSHA
 	if locate == "" || !commitExists(l.ctx, l.dir, locate) {
@@ -442,7 +434,7 @@ func unavailableRecord(in Input, phase string, gaps []string) *types.Attribution
 }
 
 func SkippedRecord(in Input) *types.AttributionRecord {
-	rec := newRecord(in, types.AttributionPhaseSnapshot)
+	rec := newRecord(in, types.AttributionPhaseFinal)
 	rec.Status = types.AttributionStatusSkipped
 	rec.EvidenceGaps = []string{"attribution step was skipped; not a clean score"}
 	types.RecalculateAttributionCounts(rec)
@@ -535,9 +527,9 @@ func MarshalRecord(rec *types.AttributionRecord) (string, error) {
 
 // ReconcileRun loads the run's steps and writes the final attribution record
 // to runs.attribution_json, the record's only store; the attribution step's
-// findings carry just the summary line. A missing snapshot is stored as
-// unavailable rather than a clean score. Skip this when the run never had an
-// attribution step (legacy).
+// findings carry just the summary line, and a step the run never reached
+// keeps none. A missing snapshot is stored as unavailable rather than a clean
+// score. Skip this when the run never had an attribution step (legacy).
 func ReconcileRun(ctx context.Context, database *db.DB, run *db.Run, repo *db.Repo, workDir string) error {
 	if database == nil || run == nil {
 		return nil
@@ -597,6 +589,9 @@ func ReconcileRun(ctx context.Context, database *db.DB, run *db.Run, repo *db.Re
 		return err
 	}
 	run.AttributionJSON = &raw
+	if attrStep.Status == types.StepStatusPending {
+		return nil
+	}
 	encoded, err := types.MarshalFindingsJSON(FindingsFrom(rec))
 	if err != nil {
 		return err

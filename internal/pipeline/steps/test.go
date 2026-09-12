@@ -403,18 +403,21 @@ func verdictFindings(findings Findings) []Finding {
 		return []Finding{{
 			Severity:    types.FindingSeverityError,
 			Action:      types.ActionAutoFix,
+			Category:    types.FindingCategoryTestVerdict,
 			Description: fmt.Sprintf("live validation verdict: no-go (%s)%s", coverage, failedScenarioSuffix(findings.Scenarios)),
 		}}
 	case types.TestVerdictInconclusive:
 		return []Finding{{
 			Severity:    types.FindingSeverityWarning,
 			Action:      types.ActionAskUser,
+			Category:    types.FindingCategoryTestVerdict,
 			Description: fmt.Sprintf("live validation verdict: inconclusive (%s)%s", coverage, untestedScenarioSuffix(findings.Scenarios)),
 		}}
 	case types.TestVerdictNoSurface:
 		return []Finding{{
 			Severity:    types.FindingSeverityWarning,
 			Action:      types.ActionAskUser,
+			Category:    types.FindingCategoryTestVerdict,
 			Description: fmt.Sprintf("this change has no live-validatable surface; proceed without live validation? (%s)%s", coverage, untestedScenarioReasonSuffix(findings.Scenarios)),
 		}}
 	default:

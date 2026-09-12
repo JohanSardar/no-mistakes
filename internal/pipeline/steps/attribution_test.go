@@ -95,6 +95,73 @@ func TestAttributionStep_DoesNotParkOrRestart(t *testing.T) {
 	}
 }
 
+// The Test step's verdict roll-up rides beside the scenario findings with the
+// same severity and action and is selected with them, but it summarises the
+// defect rather than being one; attribution records it as a non-bug.
+func TestAttributionStep_VerdictRollupIsNotABug(t *testing.T) {
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "mock"}, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Run.SubmittedHeadSHA = &headSHA
+
+	test, err := sctx.DB.InsertStepResult(sctx.Run.ID, types.StepTest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	round1 := types.Findings{
+		Items:         []types.Finding{{Severity: types.FindingSeverityError, File: "feature.txt", Line: 1, Description: "login scenario fails", Action: types.ActionAutoFix}},
+		Scenarios:     []types.TestScenario{{Name: "login", Result: types.ScenarioResultFail, Live: true}},
+		Verdict:       types.TestVerdictNoGo,
+		TestedHeadSHA: headSHA,
+		Summary:       "no-go",
+		RiskLevel:     "low",
+	}
+	round1.Items = append(round1.Items, verdictFindings(round1)...)
+	round1 = types.NormalizeFindings(round1, string(types.StepTest))
+	if len(round1.Items) != 2 {
+		t.Fatalf("expected the scenario finding plus the verdict roll-up, got %+v", round1.Items)
+	}
+	raw1, err := types.MarshalFindingsJSON(round1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	round, err := sctx.DB.InsertStepRound(test.ID, 1, "initial", &raw1, nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected := `["` + round1.Items[0].ID + `","` + round1.Items[1].ID + `"]`
+	if err := sctx.DB.SetStepRoundSelection(round.ID, &selected, db.RoundSelectionSourceAutoFix); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "feature.txt"), []byte("feature code fixed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, dir, "add", "-A")
+	gitCmd(t, dir, "commit", "-m", "pipeline fix")
+	sctx.Run.HeadSHA = gitCmd(t, dir, "rev-parse", "HEAD")
+	clean, err := types.MarshalFindingsJSON(types.Findings{Verdict: types.TestVerdictGo, TestedHeadSHA: sctx.Run.HeadSHA, Summary: "go", RiskLevel: "low"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixSummary := "fixed"
+	if _, err := sctx.DB.InsertStepRound(test.ID, 2, "auto_fix", &clean, &fixSummary, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := (&AttributionStep{}).Execute(sctx); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := attribution.UnmarshalRecord(*sctx.Run.AttributionSnapshotJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.Bugs) != 1 || rec.Counts.OriginalWorker != 1 || rec.Counts.Unknown != 0 || rec.Counts.FixedBeforeShipping != 1 {
+		t.Fatalf("verdict roll-up counted as a bug: bugs=%+v counts=%+v", rec.Bugs, rec.Counts)
+	}
+	if rec.Counts.NonBugs != 1 || rec.NonBugs[0].Kind != types.ChangeKindOther || !strings.Contains(rec.NonBugs[0].Description, "live validation verdict") {
+		t.Fatalf("verdict roll-up should be recorded as a non-bug: %+v", rec.NonBugs)
+	}
+}
+
 func TestAttributionStep_MissingMetadataIsNotCleanScore(t *testing.T) {
 	dir, baseSHA, headSHA := setupGitRepo(t)
 	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "mock"}, dir, baseSHA, headSHA, config.Commands{})

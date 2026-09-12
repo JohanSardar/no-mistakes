@@ -341,6 +341,78 @@ func TestSnapshot_FindingPathOutsideTheWorktreeIsUnknown(t *testing.T) {
 	}
 }
 
+// Session-free review rounds report the same file in whichever form they
+// like; an absolute path in one round and a relative one in the next name one
+// finding, recorded worktree-relative, not a fixed bug plus an escaped one.
+func TestSnapshot_PathFormDoesNotSplitAFinding(t *testing.T) {
+	dir, _, submitted, head := repoWithWorkerBugAndPipelineFix(t)
+	in := fixtureInput(t, dir, submitted, head)
+	review := insertStep(t, in, types.StepReview, types.StepStatusCompleted)
+	absolute := findingsJSON(types.Finding{ID: "review-1", Severity: types.FindingSeverityError, File: filepath.Join(dir, "handler.go"), Line: 2, Description: "nil deref", Action: types.ActionAutoFix})
+	relative := findingsJSON(types.Finding{ID: "review-1", Severity: types.FindingSeverityError, File: "./handler.go", Line: 2, Description: "nil deref", Action: types.ActionAutoFix})
+	insertRound(t, in, review, 1, "initial", absolute, submitted, true, false)
+	insertRound(t, in, review, 2, "auto_fix", relative, head, false, true)
+
+	rec, err := Snapshot(context.Background(), in.Input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.Bugs) != 1 || rec.Counts.FixedBeforeShipping != 0 || rec.Counts.OriginalWorker != 1 {
+		t.Fatalf("path form split the finding: bugs=%+v counts=%+v", rec.Bugs, rec.Counts)
+	}
+	if rec.Bugs[0].File != "handler.go" || rec.Bugs[0].Outcome != types.BugOutcomeStillOpen {
+		t.Fatalf("bug = %+v", rec.Bugs[0])
+	}
+}
+
+// A run that fails before reaching Attribution still records a final record
+// on the run (unavailable, never a clean score) but writes no findings onto a
+// step that never ran; a skipped step is labelled final like every other
+// stored final record.
+func TestReconcileRun_PendingStepKeepsNoFindings(t *testing.T) {
+	for _, tc := range []struct {
+		status       types.StepStatus
+		wantStatus   string
+		wantFindings bool
+	}{
+		{types.StepStatusPending, types.AttributionStatusUnavailable, false},
+		{types.StepStatusSkipped, types.AttributionStatusSkipped, true},
+	} {
+		t.Run(string(tc.status), func(t *testing.T) {
+			dir, _, submitted, head := repoWithWorkerBugAndPipelineFix(t)
+			in := fixtureInput(t, dir, submitted, head)
+			attr := insertStep(t, in, types.StepAttribution, tc.status)
+			in.Run.Status = types.RunFailed
+
+			if err := ReconcileRun(context.Background(), in.DB, in.Run, in.Repo, dir); err != nil {
+				t.Fatal(err)
+			}
+			if in.Run.AttributionJSON == nil {
+				t.Fatal("final record was not written to the run")
+			}
+			rec, err := UnmarshalRecord(*in.Run.AttributionJSON)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rec.Status != tc.wantStatus || rec.Phase != types.AttributionPhaseFinal {
+				t.Fatalf("record = %s/%s, want %s/final", rec.Status, rec.Phase, tc.wantStatus)
+			}
+			steps, err := in.DB.GetStepsByRun(in.Run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, step := range steps {
+				if step.ID != attr.ID {
+					continue
+				}
+				if (step.FindingsJSON != nil) != tc.wantFindings {
+					t.Fatalf("attribution step findings = %v, want present=%v", step.FindingsJSON, tc.wantFindings)
+				}
+			}
+		})
+	}
+}
+
 func TestSnapshot_PreExistingNotWorker(t *testing.T) {
 	dir, _, submitted, head := repoWithWorkerBugAndPipelineFix(t)
 	in := fixtureInput(t, dir, submitted, head)
@@ -673,6 +745,9 @@ func TestReconcile_KeepsSnapshotAndNotesLaterCommits(t *testing.T) {
 	if final.Counts.NonBugs == 0 {
 		t.Fatal("lint finding should be recorded as non-bug")
 	}
+	if final.Status != types.AttributionStatusComplete || containsGap(final, "reconciled") {
+		t.Fatalf("a post-snapshot commit is normal, not an evidence gap: status=%s gaps=%v", final.Status, final.EvidenceGaps)
+	}
 }
 
 // The final record keeps the snapshot's attribution even when the worktree is
@@ -710,10 +785,11 @@ func TestReconcile_NilSnapshotIsUnavailable(t *testing.T) {
 // A red CI check is a bug only when the fix round published a code change;
 // a red job the fixer declined to touch is not a confirmed bug.
 func TestSnapshot_CICheckIsABugOnlyWithAPublishedRepair(t *testing.T) {
-	ciFinding := findingsJSON(types.Finding{ID: "ci-1", Severity: types.FindingSeverityError, Action: types.ActionAutoFix, Category: types.FindingCategoryCICheck, Check: "test", CheckID: "check-7", Description: "CI check failing: test - https://ci.example/runs/1/job/1"})
-	// The same red check re-observed after the repair carries a fresh
-	// per-execution details link; it is the same check, still red.
-	relinked := findingsJSON(types.Finding{ID: "ci-1", Severity: types.FindingSeverityError, Action: types.ActionAutoFix, Category: types.FindingCategoryCICheck, Check: "test", CheckID: "check-7", Description: "CI check failing: test - https://ci.example/runs/2/job/9"})
+	ciFinding := findingsJSON(types.Finding{ID: "ci-1", Severity: types.FindingSeverityError, Action: types.ActionAutoFix, Category: types.FindingCategoryCICheck, Check: "test", CheckID: "github-check-run:111", Description: "CI check failing: test - https://ci.example/runs/1/job/1"})
+	// The same red check re-observed after the repair is a new check run: a
+	// fresh per-execution provider ID and details link. It is the same
+	// check, still red.
+	relinked := findingsJSON(types.Finding{ID: "ci-1", Severity: types.FindingSeverityError, Action: types.ActionAutoFix, Category: types.FindingCategoryCICheck, Check: "test", CheckID: "github-check-run:222", Description: "CI check failing: test - https://ci.example/runs/2/job/9"})
 	for _, tc := range []struct {
 		name          string
 		repair        bool
@@ -887,8 +963,8 @@ func TestSkippedRecordIsNotClean(t *testing.T) {
 	dir, _, submitted, head := repoWithWorkerBugAndPipelineFix(t)
 	in := fixtureInput(t, dir, submitted, head)
 	rec := SkippedRecord(in.Input)
-	if rec.Status != types.AttributionStatusSkipped {
-		t.Fatalf("status = %s", rec.Status)
+	if rec.Status != types.AttributionStatusSkipped || rec.Phase != types.AttributionPhaseFinal {
+		t.Fatalf("status = %s phase = %s", rec.Status, rec.Phase)
 	}
 	if rec.Counts.OriginalWorker != 0 {
 		t.Fatalf("skipped record invented bugs: %+v", rec.Counts)

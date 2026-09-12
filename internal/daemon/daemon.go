@@ -1431,8 +1431,6 @@ func runToInfo(d *db.DB, r *db.Run, steps []*db.StepResult) *ipc.RunInfo {
 		CIReady:                 r.CIReadyAt != nil,
 		CIReadyNoCI:             r.CIReadyNoCI,
 		PRBaseBranch:            r.PRBaseBranch,
-		WorkerProvenanceJSON:    r.WorkerProvenanceJSON,
-		FixesRunID:              r.FixesRunID,
 		AttributionJSON:         r.AttributionJSON,
 		AttributionSnapshotJSON: r.AttributionSnapshotJSON,
 		AwaitingAgent:           r.AwaitingAgentSince != nil,

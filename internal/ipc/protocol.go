@@ -331,11 +331,7 @@ type RunInfo struct {
 	CIReadyNoCI      bool            `json:"ci_ready_no_ci,omitempty"`
 	// PRBaseBranch is the per-run PR target override, if the operator set
 	// --base-branch when starting this run.
-	PRBaseBranch *string `json:"pr_base_branch,omitempty"`
-	// WorkerProvenanceJSON and FixesRunID are entry provenance. Empty on
-	// legacy runs and when the caller supplied none.
-	WorkerProvenanceJSON    *string `json:"worker_provenance,omitempty"`
-	FixesRunID              *string `json:"fixes_run_id,omitempty"`
+	PRBaseBranch            *string `json:"pr_base_branch,omitempty"`
 	AttributionJSON         *string `json:"attribution,omitempty"`
 	AttributionSnapshotJSON *string `json:"attribution_snapshot,omitempty"`
 	// AwaitingAgent is true while the run is parked at a gate awaiting the

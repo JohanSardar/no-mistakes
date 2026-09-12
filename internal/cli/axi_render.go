@@ -540,9 +540,6 @@ func (rv runView) attributionFields() []toon.Field {
 	if len(rec.EvidenceGaps) > 0 {
 		fields = append(fields, toon.Field{Key: "evidence_gaps", Value: rec.EvidenceGaps})
 	}
-	if len(rec.Limits) > 0 {
-		fields = append(fields, toon.Field{Key: "limits", Value: rec.Limits})
-	}
 	return fields
 }
 

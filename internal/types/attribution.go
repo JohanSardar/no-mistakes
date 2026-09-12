@@ -100,7 +100,6 @@ type AttributionRecord struct {
 	Counts           AttributionCounts `json:"counts"`
 	EvidenceGaps     []string          `json:"evidence_gaps,omitempty"`
 	Reconciled       bool              `json:"reconciled,omitempty"`
-	Limits           []string          `json:"limits,omitempty"`
 }
 
 // WorkerIdentity is what the record exposes: supplied values, otherwise
@@ -280,13 +279,4 @@ func RecalculateAttributionCounts(rec *AttributionRecord) {
 	}
 	c.NonBugs = len(rec.NonBugs)
 	rec.Counts = c
-}
-
-func DefaultAttributionLimits() []string {
-	return []string{
-		"A changed line is not a bug; only confirmed findings and fix-round evidence are attributed.",
-		"Git blame, last author, and the mere existence of a diff are not used as causation.",
-		"Skipped or failed steps and missing metadata are never a clean score.",
-		"A later bug-fix run does not rewrite the originating run's historical evidence.",
-	}
 }

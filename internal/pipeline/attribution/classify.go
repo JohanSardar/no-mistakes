@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -34,8 +36,10 @@ type roundFindings struct {
 // classifyStepFindings folds a step's rounds into one entry per finding
 // fingerprint. Finding IDs are positional labels the executor reassigns every
 // round, so identity across rounds is content, never the ID; a round's
-// SelectedFindingIDs are joined against that round's own findings only.
-func classifyStepFindings(step *db.StepResult, rounds []*db.StepRound) []classifiedFinding {
+// SelectedFindingIDs are joined against that round's own findings only. Paths
+// are made worktree-relative here, once, so identity, location, and the diff
+// lookup all see the same key whichever form a round reported.
+func classifyStepFindings(step *db.StepResult, rounds []*db.StepRound, dir string) []classifiedFinding {
 	if step == nil {
 		return nil
 	}
@@ -50,7 +54,7 @@ func classifyStepFindings(step *db.StepResult, rounds []*db.StepRound) []classif
 			locate = strings.TrimSpace(findings.TestedHeadSHA)
 		}
 		parsed = append(parsed, roundFindings{
-			items:    withUserFindings(findings.Items, parseFindings(round.UserFindingsJSON).Items),
+			items:    relativeFiles(dir, withUserFindings(findings.Items, parseFindings(round.UserFindingsJSON).Items)),
 			selected: selectedIDs(round),
 			locate:   locate,
 			isFix:    round.IsFixRound(),
@@ -58,7 +62,7 @@ func classifyStepFindings(step *db.StepResult, rounds []*db.StepRound) []classif
 		})
 	}
 	if len(parsed) == 0 {
-		parsed = []roundFindings{{items: parseFindings(step.FindingsJSON).Items, selected: map[string]bool{}}}
+		parsed = []roundFindings{{items: relativeFiles(dir, parseFindings(step.FindingsJSON).Items), selected: map[string]bool{}}}
 	}
 	final := make(map[string]bool)
 	finalLocations := make(map[string]bool)
@@ -121,7 +125,7 @@ func findingKind(step types.StepName, item types.Finding, selected, repairPublis
 		return types.ChangeKindDocs
 	case types.FindingCategoryLint:
 		return types.ChangeKindStyle
-	case types.FindingCategoryCIMergeConflict, types.FindingCategoryCITransient, types.FindingCategoryCIReviewBot:
+	case types.FindingCategoryCIMergeConflict, types.FindingCategoryCITransient, types.FindingCategoryCIReviewBot, types.FindingCategoryTestVerdict:
 		return types.ChangeKindOther
 	case types.FindingCategoryCICheck:
 		if selected && repairPublished {
@@ -186,6 +190,30 @@ func withUserFindings(items, user []types.Finding) []types.Finding {
 	return items
 }
 
+// relativeFiles rewrites each finding's path relative to the worktree. A path
+// outside it is kept verbatim so the locator can refuse it.
+func relativeFiles(dir string, items []types.Finding) []types.Finding {
+	for i := range items {
+		items[i].File, _ = relativePath(dir, items[i].File)
+	}
+	return items
+}
+
+func relativePath(dir, file string) (string, bool) {
+	file = strings.TrimSpace(file)
+	if file == "" {
+		return "", true
+	}
+	if filepath.IsAbs(file) {
+		rel, err := filepath.Rel(dir, file)
+		if dir == "" || err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return file, false
+		}
+		file = rel
+	}
+	return path.Clean(strings.ReplaceAll(filepath.ToSlash(file), "\\", "/")), true
+}
+
 func selectedIDs(round *db.StepRound) map[string]bool {
 	out := make(map[string]bool)
 	if round == nil || round.SelectedFindingIDs == nil {
@@ -204,8 +232,10 @@ func selectedIDs(round *db.StepRound) map[string]bool {
 }
 
 // fingerprint is a finding's identity across rounds. A CI check is identified
-// by the check itself: its description embeds the provider's per-execution
-// details link, which changes on every rerun of the same red check.
+// by its check name alone: the description embeds the provider's details link
+// and CheckID is the provider's per-execution object ID (the CI monitor's own
+// execution discriminator), and both change on every rerun of the same red
+// check.
 func fingerprint(item types.Finding) string {
 	parts := []string{
 		strings.TrimSpace(item.File),
@@ -213,7 +243,7 @@ func fingerprint(item types.Finding) string {
 		strings.Join(strings.Fields(strings.TrimSpace(item.Description)), " "),
 	}
 	if item.Category == types.FindingCategoryCICheck {
-		parts = []string{item.Category, strings.TrimSpace(item.CheckID), strings.TrimSpace(item.Check)}
+		parts = []string{item.Category, strings.TrimSpace(item.Check)}
 	}
 	norm := strings.ToLower(strings.Join(parts, "|"))
 	sum := sha256.Sum256([]byte(norm))

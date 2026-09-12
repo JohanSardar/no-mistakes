@@ -53,7 +53,7 @@ flowchart LR
   admission --> daemon["Daemon"]
   hook --> daemon
   daemon --> worktree["Disposable worktree"]
-  worktree --> pipeline["intent -> rebase -> review -> test -> document -> lint -> push -> pr -> ci"]
+  worktree --> pipeline["intent -> rebase -> review -> test -> document -> attribution -> lint -> push -> pr -> ci"]
   pipeline --> target["Push target"]
 ```
 

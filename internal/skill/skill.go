@@ -136,6 +136,21 @@ asked for that might otherwise look surprising in the diff. A few sentences to a
 short paragraph is normal - write down what you learned from the conversation
 that a reviewer reading only the diff would not know.
 
+## Record who did the work
+
+Bug attribution records which worker produced the change, but only from what
+the launch tells it. Pass ` + "`--worker-provenance`" + ` with a JSON object naming the
+identity you actually know for the agent that made the change - your own tool,
+and the model and provider when you know them, for example
+` + "`--worker-provenance '{\"tool\":\"claude-code\",\"model\":\"claude-opus-5\"}'`" + `.
+Supply only what you know: omit any field you would have to guess, never invent
+a model name, and never put account identities, private paths, or personal
+presets in it; an omitted field is recorded as unknown, which is the truthful
+answer. When the task repairs a bug that an earlier no-mistakes run shipped and
+you know that run's ID (from ` + "`no-mistakes axi status`" + ` or the PR it opened), add
+` + "`--fixes-run <run-id>`" + ` so the repair is linked back to that run. Free-text
+intent is never that link.
+
 ## Validate and decide
 
 Run the pipeline and decide on its findings as they come up:

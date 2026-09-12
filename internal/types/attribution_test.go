@@ -2,7 +2,6 @@ package types
 
 import (
 	"encoding/json"
-	"strings"
 	"testing"
 )
 
@@ -88,8 +87,5 @@ func TestRecalculateAttributionCounts(t *testing.T) {
 	}
 	if rec.Counts.FixedBeforeShipping != 2 || rec.Counts.Escaped != 1 || rec.Counts.NonBugs != 1 {
 		t.Fatalf("outcome counts = %+v", rec.Counts)
-	}
-	if strings.Contains(strings.Join(DefaultAttributionLimits(), "\n"), "blame") == false {
-		t.Fatal("limits should document the blame prohibition")
 	}
 }
