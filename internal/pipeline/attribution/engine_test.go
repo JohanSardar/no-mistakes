@@ -1131,7 +1131,6 @@ func TestSnapshot_SyncedEarlierRunPipelineLinesAreUnknownNotWorker(t *testing.T)
 	earlier := insertPriorRun(t, in, "feature", firstSubmitted, firstHead)
 	abandonedHead := gitCmd(t, dir, "commit-tree", firstSubmitted+"^{tree}", "-p", firstSubmitted, "-m", "superseded pipeline commit")
 	insertPriorRun(t, in, "feature", firstSubmitted, abandonedHead)
-	insertPriorRun(t, in, "other", firstSubmitted, firstHead)
 	review := insertStep(t, in, types.StepReview, types.StepStatusCompleted)
 	insertRound(t, in, review, 1, "initial", findingsJSON(
 		types.Finding{ID: "review-1", Severity: types.FindingSeverityError, File: "handler.go", Line: 2, Description: "first worker bug", Action: types.ActionAutoFix},
@@ -1164,6 +1163,85 @@ func TestSnapshot_SyncedEarlierRunPipelineLinesAreUnknownNotWorker(t *testing.T)
 	}
 	if containsGap(rec, abandonedHead[:12]) {
 		t.Fatalf("a superseded run outside the submitted history was applied: %v", rec.EvidenceGaps)
+	}
+}
+
+// The current run's Rebase step rewrites the synced history whenever the
+// default branch moved, so nothing review examined descends from the earlier
+// run's head any more. Ancestry is proven against the immutable submitted
+// head, and the span is read as content diffs at the reviewed commit, so the
+// earlier pipeline line is still unknown rather than the worker's.
+func TestSnapshot_EarlierRunSpanSurvivesTheCurrentRunsRebase(t *testing.T) {
+	dir, _, firstSubmitted, firstHead := repoWithWorkerBugAndPipelineFix(t)
+	submitted := commitFile(t, dir, "handler.go", "package handler\nfunc worker() {}\nfunc pipelineFix() {}\nfunc later() {}\n", "worker change after sync")
+	gitCmd(t, dir, "checkout", "main")
+	commitFile(t, dir, "upstream.go", "package base\nfunc upstream() {}\n", "main moved")
+	gitCmd(t, dir, "checkout", "feature")
+	gitCmd(t, dir, "rebase", "main")
+	rebased := gitCmd(t, dir, "rev-parse", "HEAD")
+	ancestry := exec.Command("git", "merge-base", "--is-ancestor", firstHead, rebased)
+	ancestry.Dir = dir
+	if rebased == submitted || ancestry.Run() == nil {
+		t.Fatalf("fixture did not rewrite the synced history: rebased=%s submitted=%s", rebased, submitted)
+	}
+	in := fixtureInput(t, dir, submitted, rebased)
+	earlier := insertPriorRun(t, in, "feature", firstSubmitted, firstHead)
+	review := insertStep(t, in, types.StepReview, types.StepStatusCompleted)
+	insertRound(t, in, review, 1, "initial", findingsJSON(
+		types.Finding{ID: "review-1", Severity: types.FindingSeverityError, File: "handler.go", Line: 2, Description: "first worker bug", Action: types.ActionAutoFix},
+		types.Finding{ID: "review-2", Severity: types.FindingSeverityError, File: "handler.go", Line: 3, Description: "earlier pipeline bug", Action: types.ActionAutoFix},
+		types.Finding{ID: "review-3", Severity: types.FindingSeverityError, File: "handler.go", Line: 4, Description: "later worker bug", Action: types.ActionAutoFix},
+		types.Finding{ID: "review-4", Severity: types.FindingSeverityError, File: "upstream.go", Line: 2, Description: "upstream bug", Action: types.ActionAutoFix},
+	), rebased, false, false)
+
+	rec, err := Snapshot(context.Background(), in.Input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Counts.OriginalWorker != 2 || rec.Counts.Unknown != 1 || rec.Counts.Pipeline != 0 || rec.Counts.PreExisting != 1 {
+		t.Fatalf("counts = %+v bugs=%+v gaps=%v", rec.Counts, rec.Bugs, rec.EvidenceGaps)
+	}
+	byDesc := bugsByDescription(rec)
+	if got := byDesc["earlier pipeline bug"]; got.Attribution != types.AttributionUnknown || !strings.Contains(strings.Join(got.Evidence, "\n"), earlier.ID) {
+		t.Fatalf("earlier run's pipeline line was claimed after the rebase: %+v", got)
+	}
+	for _, desc := range []string{"first worker bug", "later worker bug"} {
+		if got := byDesc[desc]; got.Attribution != types.AttributionOriginalWorker || got.Confidence != types.AttributionConfidenceMedium {
+			t.Fatalf("%s = %+v, want original_worker/medium after the rewrite", desc, got)
+		}
+	}
+	if got := byDesc["upstream bug"]; got.Attribution != types.AttributionPreExisting {
+		t.Fatalf("a line the rebase brought in from main = %+v, want pre_existing", got)
+	}
+}
+
+// A branch stacked on the synced head of an earlier run (`axi run
+// --base-branch`) inherits that run's pipeline commits exactly like a re-push
+// of the same branch; the run row's branch name is not what proves it.
+func TestSnapshot_StackedBranchInheritsEarlierRunPipelineSpan(t *testing.T) {
+	dir, _, firstSubmitted, firstHead := repoWithWorkerBugAndPipelineFix(t)
+	gitCmd(t, dir, "checkout", "-b", "feature-2")
+	submitted := commitFile(t, dir, "handler.go", "package handler\nfunc worker() {}\nfunc pipelineFix() {}\nfunc later() {}\n", "stacked worker change")
+	in := fixtureInput(t, dir, submitted, submitted)
+	in.Run.Branch = "feature-2"
+	earlier := insertPriorRun(t, in, "feature", firstSubmitted, firstHead)
+	review := insertStep(t, in, types.StepReview, types.StepStatusCompleted)
+	insertRound(t, in, review, 1, "initial", findingsJSON(
+		types.Finding{ID: "review-1", Severity: types.FindingSeverityError, File: "handler.go", Line: 2, Description: "first worker bug", Action: types.ActionAutoFix},
+		types.Finding{ID: "review-2", Severity: types.FindingSeverityError, File: "handler.go", Line: 3, Description: "earlier pipeline bug", Action: types.ActionAutoFix},
+		types.Finding{ID: "review-3", Severity: types.FindingSeverityError, File: "handler.go", Line: 4, Description: "later worker bug", Action: types.ActionAutoFix},
+	), submitted, false, false)
+
+	rec, err := Snapshot(context.Background(), in.Input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Counts.OriginalWorker != 2 || rec.Counts.Unknown != 1 {
+		t.Fatalf("counts = %+v bugs=%+v gaps=%v", rec.Counts, rec.Bugs, rec.EvidenceGaps)
+	}
+	byDesc := bugsByDescription(rec)
+	if got := byDesc["earlier pipeline bug"]; got.Attribution != types.AttributionUnknown || !containsGap(rec, earlier.ID) {
+		t.Fatalf("stacked branch claimed the earlier run's pipeline line: %+v gaps=%v", got, rec.EvidenceGaps)
 	}
 }
 

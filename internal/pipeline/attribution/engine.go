@@ -27,10 +27,11 @@ type Input struct {
 	Repo    *db.Repo
 	Steps   []*db.StepResult
 	Rounds  map[string][]*db.StepRound
-	// PriorRuns are the repository's other recorded runs. Those on the same
-	// branch whose recorded head is in the submitted history contributed
-	// pipeline commits the worker synced before submitting; the lines those
-	// commits added are read from the run rows, never reconstructed.
+	// PriorRuns are the repository's other recorded runs. Those whose recorded
+	// head is an ancestor of the submitted head contributed pipeline commits
+	// the worker synced before submitting, on this branch or one stacked on
+	// it; the lines those commits added are read from the run rows, never
+	// reconstructed.
 	PriorRuns []*db.Run
 	HeadSHA   string
 	PRURL     string
@@ -218,10 +219,13 @@ type locator struct {
 	// the submission; a later rewrite (a CI merge-conflict repair restarting
 	// review) has no such stand-in and locations after it are unknown.
 	firstReviewHead string
-	// priorRuns are earlier runs on the same branch. Each one whose recorded
-	// head is an ancestor of a located commit carried its own pipeline commits
-	// (submitted head..recorded head) into that history; a line those commits
-	// added is neither this run's worker's nor its pipeline's.
+	// priorRuns are the repository's earlier runs whose recorded head is an
+	// ancestor of the submitted head: the worker synced their pipeline commits
+	// (submitted head..recorded head) before submitting, on this branch or one
+	// stacked on it. Ancestry is tested against the immutable submission, not
+	// the located commit, so this run's own Rebase rewrite cannot hide them.
+	// A line those commits added is neither this run's worker's nor its
+	// pipeline's.
 	priorRuns   []*db.Run
 	anchors     map[string]*anchor
 	diffs       map[string]map[string]map[int]struct{}
@@ -238,8 +242,8 @@ type anchor struct {
 	prior      []priorRange
 }
 
-// priorRange is an earlier run's pipeline span, from..to, both in the located
-// commit's history. from falls back to the branch base when that run's
+// priorRange is an earlier run's pipeline span, from..to, read at the located
+// commit as content diffs. from falls back to the branch base when that run's
 // submitted head is no longer available, which leaves everything the branch
 // had at its recorded head unknown rather than the worker's.
 type priorRange struct {
@@ -255,11 +259,6 @@ func newLocator(ctx context.Context, in Input) *locator {
 	}
 	if in.Run != nil {
 		l.rerun = in.Run.Rerun
-		for _, prior := range in.PriorRuns {
-			if prior != nil && prior.ID != in.Run.ID && prior.Branch == in.Run.Branch {
-				l.priorRuns = append(l.priorRuns, prior)
-			}
-		}
 	}
 	if l.dir == "" {
 		l.unavailable = "worktree path is missing; git location is unknown"
@@ -284,6 +283,16 @@ func newLocator(ctx context.Context, in Input) *locator {
 		if live, err := git.HeadSHA(ctx, l.dir); err == nil {
 			l.head = strings.TrimSpace(live)
 		}
+	}
+	for _, prior := range in.PriorRuns {
+		if prior == nil || prior.ID == in.Run.ID {
+			continue
+		}
+		to := strings.TrimSpace(prior.HeadSHA)
+		if to == "" || to == strings.TrimSpace(deref(prior.SubmittedHeadSHA)) || !isAncestor(ctx, l.dir, to, l.submitted) {
+			continue
+		}
+		l.priorRuns = append(l.priorRuns, prior)
 	}
 	for _, step := range in.Steps {
 		if step == nil || step.StepName != types.StepReview {
@@ -416,18 +425,11 @@ func (l *locator) anchorFor(locate string) *anchor {
 		return a
 	}
 	for _, prior := range l.priorRuns {
-		to := strings.TrimSpace(prior.HeadSHA)
-		if to == "" || !isAncestor(l.ctx, l.dir, to, locate) {
-			continue
-		}
 		from := strings.TrimSpace(deref(prior.SubmittedHeadSHA))
-		if from == to {
-			continue
-		}
 		if !commitExists(l.ctx, l.dir, from) {
 			from = a.base
 		}
-		a.prior = append(a.prior, priorRange{runID: prior.ID, from: from, to: to})
+		a.prior = append(a.prior, priorRange{runID: prior.ID, from: from, to: strings.TrimSpace(prior.HeadSHA)})
 	}
 	return a
 }
