@@ -1245,6 +1245,47 @@ func TestSnapshot_StackedBranchInheritsEarlierRunPipelineSpan(t *testing.T) {
 	}
 }
 
+// A prior run merged into the default branch via a merge commit is an
+// ancestor of every later branch's submitted head, but its lines already sit
+// in the merge-base tree and can never be in branchAdded. The locator must
+// not pay a tree diff against that run — even if its submitted head is
+// unreadable — and a new worker line stays original_worker.
+func TestSnapshot_MergedPriorRunDoesNotPayATreeDiff(t *testing.T) {
+	dir, _, _, firstHead := repoWithWorkerBugAndPipelineFix(t)
+	gitCmd(t, dir, "checkout", "main")
+	gitCmd(t, dir, "merge", "--no-ff", "feature", "-m", "merge feature")
+	merged := gitCmd(t, dir, "rev-parse", "HEAD")
+	parents := strings.Fields(gitCmd(t, dir, "rev-list", "--parents", "-n", "1", merged))
+	if merged == firstHead || len(parents) < 3 {
+		t.Fatalf("fixture did not create a merge commit: merged=%s firstHead=%s parents=%v", merged, firstHead, parents)
+	}
+	gitCmd(t, dir, "checkout", "-b", "feature-201")
+	submitted := commitFile(t, dir, "later.go", "package later\nfunc workerLater() {}\n", "new worker line")
+	in := fixtureInput(t, dir, submitted, submitted)
+	in.Run.Branch = "feature-201"
+	insertPriorRun(t, in, "feature", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", firstHead)
+	review := insertStep(t, in, types.StepReview, types.StepStatusCompleted)
+	insertRound(t, in, review, 1, "initial", findingsJSON(
+		types.Finding{ID: "review-1", Severity: types.FindingSeverityError, File: "later.go", Line: 2, Description: "new worker bug", Action: types.ActionAutoFix},
+	), submitted, false, false)
+
+	rec, err := Snapshot(context.Background(), in.Input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Counts.OriginalWorker != 1 || rec.Counts.Unknown != 0 {
+		t.Fatalf("counts = %+v bugs=%+v gaps=%v", rec.Counts, rec.Bugs, rec.EvidenceGaps)
+	}
+	if containsGap(rec, "could not diff") {
+		t.Fatalf("paid a tree diff against the merged prior: gaps=%v", rec.EvidenceGaps)
+	}
+	loc := newLocator(context.Background(), in.Input)
+	a := loc.anchorFor(submitted)
+	if len(a.prior) != 0 {
+		t.Fatalf("merged prior kept as a span: %+v", a.prior)
+	}
+}
+
 // When the earlier run's submitted head is no longer in the repository its
 // pipeline span cannot be bounded, so everything the branch had at that run's
 // recorded head is unknown; only lines added after it are the worker's.

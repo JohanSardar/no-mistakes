@@ -27,11 +27,11 @@ type Input struct {
 	Repo    *db.Repo
 	Steps   []*db.StepResult
 	Rounds  map[string][]*db.StepRound
-	// PriorRuns are the repository's other recorded runs. Those whose recorded
-	// head is an ancestor of the submitted head contributed pipeline commits
-	// the worker synced before submitting, on this branch or one stacked on
-	// it; the lines those commits added are read from the run rows, never
-	// reconstructed.
+	// PriorRuns are the repository's other recorded runs. The locator keeps
+	// those with a pipeline span (recorded head != submitted head) and, at
+	// the first locate, those whose recorded head is an ancestor of the
+	// immutable submitted head and not already in the branch base. Lines
+	// those commits added are read from the run rows, never reconstructed.
 	PriorRuns []*db.Run
 	HeadSHA   string
 	PRURL     string
@@ -219,13 +219,12 @@ type locator struct {
 	// the submission; a later rewrite (a CI merge-conflict repair restarting
 	// review) has no such stand-in and locations after it are unknown.
 	firstReviewHead string
-	// priorRuns are the repository's earlier runs whose recorded head is an
-	// ancestor of the submitted head: the worker synced their pipeline commits
-	// (submitted head..recorded head) before submitting, on this branch or one
-	// stacked on it. Ancestry is tested against the immutable submission, not
-	// the located commit, so this run's own Rebase rewrite cannot hide them.
-	// A line those commits added is neither this run's worker's nor its
-	// pipeline's.
+	// priorRuns are earlier runs that recorded a pipeline span. Whether that
+	// span applies is decided at the first locate, after the branch base is
+	// known: a head already in the merge-base tree cannot enter branchAdded,
+	// and a head that is not an ancestor of the immutable submitted head was
+	// never synced. Construction does not probe ancestry, so a run with no
+	// confirmed bugs does not pay O(#runs) git work.
 	priorRuns   []*db.Run
 	anchors     map[string]*anchor
 	diffs       map[string]map[string]map[int]struct{}
@@ -285,11 +284,11 @@ func newLocator(ctx context.Context, in Input) *locator {
 		}
 	}
 	for _, prior := range in.PriorRuns {
-		if prior == nil || prior.ID == in.Run.ID {
+		if prior == nil || in.Run == nil || prior.ID == in.Run.ID {
 			continue
 		}
 		to := strings.TrimSpace(prior.HeadSHA)
-		if to == "" || to == strings.TrimSpace(deref(prior.SubmittedHeadSHA)) || !isAncestor(ctx, l.dir, to, l.submitted) {
+		if to == "" || to == strings.TrimSpace(deref(prior.SubmittedHeadSHA)) {
 			continue
 		}
 		l.priorRuns = append(l.priorRuns, prior)
@@ -425,11 +424,18 @@ func (l *locator) anchorFor(locate string) *anchor {
 		return a
 	}
 	for _, prior := range l.priorRuns {
+		to := strings.TrimSpace(prior.HeadSHA)
+		if isAncestor(l.ctx, l.dir, to, a.base) {
+			continue
+		}
+		if !isAncestor(l.ctx, l.dir, to, l.submitted) {
+			continue
+		}
 		from := strings.TrimSpace(deref(prior.SubmittedHeadSHA))
 		if !commitExists(l.ctx, l.dir, from) {
 			from = a.base
 		}
-		a.prior = append(a.prior, priorRange{runID: prior.ID, from: from, to: strings.TrimSpace(prior.HeadSHA)})
+		a.prior = append(a.prior, priorRange{runID: prior.ID, from: from, to: to})
 	}
 	return a
 }
