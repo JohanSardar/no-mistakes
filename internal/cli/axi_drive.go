@@ -283,6 +283,9 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 			return emitError(cmd, 2, err.Error())
 		}
 		fixesRunID = strings.TrimSpace(fixesRunID)
+		if err := validateAxiRunFixesRun(env, fixesRunID); err != nil {
+			return emitError(cmd, 2, err.Error())
+		}
 		if launchNonce != "" {
 			launchReceipt, err = triggerProofRun(ctx, env, branch, headSHA, skipSteps, intent, baseBranch, launchNonce, validationGeneration, workerRaw, fixesRunID)
 			if err == nil {
@@ -333,6 +336,29 @@ func validateAxiRunBaseBranch(ctx context.Context, baseBranch string) error {
 		return nil
 	}
 	return steps.VerifyRemoteBranchExists(ctx, ".", normalized)
+}
+
+// validateAxiRunFixesRun checks --fixes-run against the daemon before the
+// push. The gate hook is post-receive, so the daemon's own refusal (its
+// validateFixesRun stays the authoritative check) would otherwise land after
+// the branch head had moved with no run to gate it, and a corrected retry
+// could only rerun a head no launch had recorded as the worker's.
+func validateAxiRunFixesRun(env *axiEnv, fixesRunID string) error {
+	if fixesRunID == "" {
+		return nil
+	}
+	notInRepo := fmt.Errorf("--fixes-run %q is not a run in this repository", fixesRunID)
+	var result ipc.GetRunResult
+	if err := env.client.Call(ipc.MethodGetRun, &ipc.GetRunParams{RunID: fixesRunID}, &result); err != nil {
+		if isExactRunNotFound(err, fixesRunID) {
+			return notInRepo
+		}
+		return fmt.Errorf("--fixes-run: look up run %s: %w", fixesRunID, err)
+	}
+	if result.Run == nil || result.Run.RepoID != env.repo.ID {
+		return notInRepo
+	}
+	return nil
 }
 
 // conflictingActiveRunPRBaseBranch reports when --base-branch would be
