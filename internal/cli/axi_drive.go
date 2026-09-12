@@ -177,7 +177,7 @@ func newAxiRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&launchNonce, "launch-nonce", "", "opaque nonce for a daemon-bound pre-drive launch receipt")
 	cmd.Flags().StringVar(&validationGeneration, "validation-generation", "", "opaque generation bound to --launch-nonce proof mode")
 	cmd.Flags().StringVar(&baseBranch, "base-branch", "", "integration branch to open the PR against for this run only (overrides pr.base_branch)")
-	cmd.Flags().StringVar(&workerProvenance, "worker-provenance", "", "JSON object of the originating worker identity (tool/model/provider/settings, optional task_id/external_run_id); prefix with @ to read a file. Unset fields stay unknown. Also accepted from NO_MISTAKES_WORKER_PROVENANCE")
+	cmd.Flags().StringVar(&workerProvenance, "worker-provenance", "", "JSON object of the originating worker identity (tool/model/provider/settings, optional task_id/external_run_id); unset fields stay unknown")
 	cmd.Flags().StringVar(&fixesRunID, "fixes-run", "", "typed signal that this run is a later bug-fix of an earlier run ID in the same repository")
 	bindAxiWaitFlag(cmd, &wait)
 	return cmd
@@ -278,7 +278,7 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 		if guard := preflightGuard(ctx, env, branch); guard != nil {
 			return guard(cmd)
 		}
-		workerRaw, err := loadWorkerProvenanceInput(workerProvenance)
+		workerRaw, err := validateWorkerProvenance(workerProvenance)
 		if err != nil {
 			return emitError(cmd, 2, err.Error())
 		}

@@ -429,29 +429,15 @@ func jsonRawIfAny(s string) json.RawMessage {
 	return json.RawMessage(s)
 }
 
-func loadWorkerProvenanceInput(raw string) (string, error) {
+func validateWorkerProvenance(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		raw = strings.TrimSpace(os.Getenv("NO_MISTAKES_WORKER_PROVENANCE"))
-	}
-	if raw == "" {
 		return "", nil
-	}
-	if strings.HasPrefix(raw, "@") {
-		path := strings.TrimSpace(strings.TrimPrefix(raw, "@"))
-		if path == "" {
-			return "", fmt.Errorf("worker provenance @path is empty")
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return "", fmt.Errorf("read worker provenance: %w", err)
-		}
-		raw = string(data)
 	}
 	if _, err := types.ParseWorkerProvenance(raw); err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(raw), nil
+	return raw, nil
 }
 
 func formatSkipPushOptions(steps []types.StepName) []string {

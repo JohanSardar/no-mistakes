@@ -1220,6 +1220,12 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		repo = refreshed
 	}
 
+	attr.Normalize()
+	if err := m.validateFixesRun(repo, attr); err != nil {
+		trackStartFailure("invalid_fixes_run")
+		return "", err
+	}
+
 	// Cancel any active run for this repo+branch.
 	m.cancelActiveRuns(repo.ID, branch)
 
@@ -1246,7 +1252,7 @@ func (m *RunManager) startRunWithIntentSourceLocked(ctx context.Context, repo *d
 		trackStartFailure("create_run")
 		return "", fmt.Errorf("create run: %w", err)
 	}
-	if err := m.applyLaunchAttribution(repo, run, attr); err != nil {
+	if err := m.applyLaunchAttribution(run, attr); err != nil {
 		m.db.UpdateRunError(run.ID, err.Error())
 		trackStartFailure("launch_attribution")
 		return "", err
@@ -1840,7 +1846,7 @@ func (m *RunManager) cancelActiveRuns(repoID, branch string) {
 
 func launchAttributionFrom(worker json.RawMessage, fixesRunID string) (types.LaunchAttribution, error) {
 	attr := types.LaunchAttribution{FixesRunID: strings.TrimSpace(fixesRunID)}
-	if len(bytesTrim(worker)) == 0 {
+	if strings.TrimSpace(string(worker)) == "" {
 		attr.Normalize()
 		return attr, nil
 	}
@@ -1851,10 +1857,6 @@ func launchAttributionFrom(worker json.RawMessage, fixesRunID string) (types.Lau
 	attr.Worker = parsed
 	attr.Normalize()
 	return attr, nil
-}
-
-func bytesTrim(raw json.RawMessage) []byte {
-	return []byte(strings.TrimSpace(string(raw)))
 }
 
 func inheritLaunchAttribution(attr types.LaunchAttribution, selected *db.Run) types.LaunchAttribution {
@@ -1874,22 +1876,27 @@ func inheritLaunchAttribution(attr types.LaunchAttribution, selected *db.Run) ty
 	return attr
 }
 
-func (m *RunManager) applyLaunchAttribution(repo *db.Repo, run *db.Run, attr types.LaunchAttribution) error {
-	attr.Normalize()
-	if attr.IsEmpty() {
+// validateFixesRun checks the typed bug-fix reference before the launch
+// mutates anything: the run it names must exist in this repository. It runs
+// ahead of cancelActiveRuns and the run insert so a typo in an optional flag
+// neither supersedes a healthy run nor binds a failed row to a launch nonce.
+func (m *RunManager) validateFixesRun(repo *db.Repo, attr types.LaunchAttribution) error {
+	if attr.FixesRunID == "" {
 		return nil
 	}
-	if attr.FixesRunID != "" {
-		origin, err := m.db.GetRun(attr.FixesRunID)
-		if err != nil {
-			return fmt.Errorf("lookup fixes-run: %w", err)
-		}
-		if origin == nil || origin.RepoID != repo.ID {
-			return fmt.Errorf("fixes-run %q is not a run in this repository", attr.FixesRunID)
-		}
-		if origin.ID == run.ID {
-			return fmt.Errorf("fixes-run cannot name the run being created")
-		}
+	origin, err := m.db.GetRun(attr.FixesRunID)
+	if err != nil {
+		return fmt.Errorf("lookup fixes-run: %w", err)
+	}
+	if origin == nil || origin.RepoID != repo.ID {
+		return fmt.Errorf("fixes-run %q is not a run in this repository", attr.FixesRunID)
+	}
+	return nil
+}
+
+func (m *RunManager) applyLaunchAttribution(run *db.Run, attr types.LaunchAttribution) error {
+	if attr.IsEmpty() {
+		return nil
 	}
 	workerJSON := ""
 	if attr.Worker != nil {

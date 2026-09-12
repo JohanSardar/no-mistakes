@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"strconv"
 	"strings"
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
@@ -14,72 +15,107 @@ type classifiedFinding struct {
 	Finding    types.Finding
 	SourceStep types.StepName
 	Kind       string // bug or a ChangeKind*
-	Selected   bool
-	Fixed      bool
-	LocateSHA  string
+	// Outcome is set for bugs only: still open in the step's final round,
+	// fixed before shipping, or unknown when it vanished without a fix.
+	Outcome string
+	// LocateSHA is the commit whose coordinates Finding.File/Line use; empty
+	// when the round recorded none.
+	LocateSHA string
 }
 
+type roundFindings struct {
+	items    []types.Finding
+	selected map[string]bool
+	locate   string
+	isFix    bool
+	repair   bool
+}
+
+// classifyStepFindings folds a step's rounds into one entry per finding
+// fingerprint. Finding IDs are positional labels the executor reassigns every
+// round, so identity across rounds is content, never the ID; a round's
+// SelectedFindingIDs are joined against that round's own findings only.
 func classifyStepFindings(step *db.StepResult, rounds []*db.StepRound) []classifiedFinding {
 	if step == nil {
 		return nil
 	}
-	selected := selectedIDs(rounds)
-	fixed := fixedIDs(rounds, selected)
+	var parsed []roundFindings
+	for _, round := range rounds {
+		if round == nil {
+			continue
+		}
+		parsed = append(parsed, roundFindings{
+			items:    parseFindingItems(round.FindingsJSON),
+			selected: selectedIDs(round),
+			locate:   deref(round.ReviewedHeadSHA),
+			isFix:    round.IsFixRound(),
+			repair:   round.RepairPublished,
+		})
+	}
+	if len(parsed) == 0 {
+		parsed = []roundFindings{{items: parseFindingItems(step.FindingsJSON), selected: map[string]bool{}}}
+	}
+	final := make(map[string]bool)
+	for _, item := range parsed[len(parsed)-1].items {
+		final[fingerprint(item)] = true
+	}
+
 	var out []classifiedFinding
-	seen := make(map[string]bool)
-	appendFrom := func(raw *string, locateSHA string) {
-		if raw == nil || strings.TrimSpace(*raw) == "" {
-			return
-		}
-		findings, err := types.ParseFindingsJSON(*raw)
-		if err != nil {
-			return
-		}
-		for _, item := range findings.Items {
-			key := item.ID
-			if key == "" {
-				key = fingerprint(item)
+	index := make(map[string]int)
+	for i, rf := range parsed {
+		fixFollows, repairFollows := false, false
+		for _, later := range parsed[i+1:] {
+			if later.isFix {
+				fixFollows = true
+				repairFollows = repairFollows || later.repair
 			}
-			if seen[key] {
+		}
+		for _, item := range rf.items {
+			fp := fingerprint(item)
+			selected := rf.selected[item.ID]
+			kind := findingKind(step.StepName, item, selected, repairFollows)
+			fixed := selected && fixFollows && !final[fp]
+			if j, ok := index[fp]; ok {
+				if kind == types.ChangeKindBug {
+					out[j].Kind = kind
+				}
+				if fixed {
+					out[j].Outcome = types.BugOutcomeFixedBeforeShipping
+				}
 				continue
 			}
-			seen[key] = true
-			kind := findingKind(step.StepName, item)
-			sel, wasFixed := selected[item.ID], fixed[item.ID]
-			if kind != types.ChangeKindBug && (sel || wasFixed) && isCorrectnessFinding(step.StepName, item) {
-				kind = types.ChangeKindBug
+			cf := classifiedFinding{Finding: item, SourceStep: step.StepName, Kind: kind, LocateSHA: strings.TrimSpace(rf.locate)}
+			switch {
+			case final[fp]:
+				cf.Outcome = types.BugOutcomeStillOpen
+			case fixed:
+				cf.Outcome = types.BugOutcomeFixedBeforeShipping
+			default:
+				cf.Outcome = types.BugOutcomeUnknown
 			}
-			out = append(out, classifiedFinding{
-				Finding:    item,
-				SourceStep: step.StepName,
-				Kind:       kind,
-				Selected:   sel,
-				Fixed:      wasFixed,
-				LocateSHA:  locateSHA,
-			})
+			index[fp] = len(out)
+			out = append(out, cf)
 		}
 	}
-	for _, round := range rounds {
-		locate := ""
-		if round.ReviewedHeadSHA != nil {
-			locate = strings.TrimSpace(*round.ReviewedHeadSHA)
-		}
-		if locate == "" && round.StartingHeadSHA != nil {
-			locate = strings.TrimSpace(*round.StartingHeadSHA)
-		}
-		appendFrom(round.FindingsJSON, locate)
-	}
-	appendFrom(step.FindingsJSON, "")
 	return out
 }
 
-func findingKind(step types.StepName, item types.Finding) string {
+// findingKind decides whether a finding is a confirmed bug. A CI check is a
+// bug only with evidence that the code was wrong: the finding was selected
+// for repair and a later fix round published a code change. A red job on its
+// own (a flaky runner, a tool version drift) is not.
+func findingKind(step types.StepName, item types.Finding, selected, repairPublished bool) string {
 	switch item.Category {
 	case types.FindingCategoryDocumentation:
 		return types.ChangeKindDocs
 	case types.FindingCategoryLint:
 		return types.ChangeKindStyle
 	case types.FindingCategoryCIMergeConflict, types.FindingCategoryCITransient, types.FindingCategoryCIReviewBot:
+		return types.ChangeKindOther
+	case types.FindingCategoryCICheck:
+		if selected && repairPublished {
+			return types.ChangeKindBug
+		}
 		return types.ChangeKindOther
 	}
 	switch step {
@@ -92,79 +128,45 @@ func findingKind(step types.StepName, item types.Finding) string {
 		return types.ChangeKindOther
 	}
 	sev := types.NormalizeFindingSeverity(item.Severity)
-	act := item.ActionOrDefault()
-	if sev == types.FindingSeverityInfo || act == types.ActionNoOp {
+	if sev != types.FindingSeverityError && sev != types.FindingSeverityWarning {
 		return types.ChangeKindOther
 	}
-	if step == types.StepReview || step == types.StepTest || step == types.StepCI || item.Category == types.FindingCategoryCICheck {
-		if sev == types.FindingSeverityError || sev == types.FindingSeverityWarning {
-			if act == types.ActionAutoFix {
-				return types.ChangeKindBug
-			}
-			// ask-user findings are design/intent unless a fix round actually
-			// selected them; that selection is applied by the caller via Fixed.
-			return types.ChangeKindOther
-		}
+	if step != types.StepReview && step != types.StepTest {
+		return types.ChangeKindOther
 	}
+	act := item.ActionOrDefault()
+	if act == types.ActionAutoFix || (selected && act != types.ActionNoOp) {
+		return types.ChangeKindBug
+	}
+	// An ask-user finding is a design/intent question unless a fix round
+	// actually selected it.
 	return types.ChangeKindOther
 }
 
-func isCorrectnessFinding(step types.StepName, item types.Finding) bool {
-	if item.ReviewScope == types.FindingReviewScopePipelineOwnedDelivery {
-		return false
+func parseFindingItems(raw *string) []types.Finding {
+	if raw == nil || strings.TrimSpace(*raw) == "" {
+		return nil
 	}
-	switch item.Category {
-	case types.FindingCategoryDocumentation, types.FindingCategoryLint,
-		types.FindingCategoryCIMergeConflict, types.FindingCategoryCITransient, types.FindingCategoryCIReviewBot:
-		return false
+	findings, err := types.ParseFindingsJSON(*raw)
+	if err != nil {
+		return nil
 	}
-	sev := types.NormalizeFindingSeverity(item.Severity)
-	if sev != types.FindingSeverityError && sev != types.FindingSeverityWarning {
-		return false
-	}
-	switch step {
-	case types.StepReview, types.StepTest, types.StepCI:
-		return true
-	}
-	return item.Category == types.FindingCategoryCICheck
+	return findings.Items
 }
 
-func selectedIDs(rounds []*db.StepRound) map[string]bool {
+func selectedIDs(round *db.StepRound) map[string]bool {
 	out := make(map[string]bool)
-	for _, round := range rounds {
-		if round == nil || round.SelectedFindingIDs == nil {
-			continue
-		}
-		var ids []string
-		if json.Unmarshal([]byte(*round.SelectedFindingIDs), &ids) != nil {
-			continue
-		}
-		for _, id := range ids {
-			if id != "" {
-				out[id] = true
-			}
-		}
-	}
-	return out
-}
-
-func fixedIDs(rounds []*db.StepRound, selected map[string]bool) map[string]bool {
-	out := make(map[string]bool)
-	if len(selected) == 0 {
+	if round == nil || round.SelectedFindingIDs == nil {
 		return out
 	}
-	sawFix := false
-	for _, round := range rounds {
-		if round != nil && round.IsFixRound() {
-			sawFix = true
-			break
-		}
-	}
-	if !sawFix {
+	var ids []string
+	if json.Unmarshal([]byte(*round.SelectedFindingIDs), &ids) != nil {
 		return out
 	}
-	for id := range selected {
-		out[id] = true
+	for _, id := range ids {
+		if id != "" {
+			out[id] = true
+		}
 	}
 	return out
 }
@@ -172,31 +174,9 @@ func fixedIDs(rounds []*db.StepRound, selected map[string]bool) map[string]bool 
 func fingerprint(item types.Finding) string {
 	norm := strings.ToLower(strings.Join([]string{
 		strings.TrimSpace(item.File),
-		itoa(item.Line),
+		strconv.Itoa(item.Line),
 		strings.Join(strings.Fields(strings.TrimSpace(item.Description)), " "),
 	}, "|"))
 	sum := sha256.Sum256([]byte(norm))
 	return hex.EncodeToString(sum[:])[:16]
-}
-
-func itoa(v int) string {
-	if v == 0 {
-		return "0"
-	}
-	var buf [20]byte
-	i := len(buf)
-	n := v
-	if n < 0 {
-		n = -n
-	}
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if v < 0 {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
 }

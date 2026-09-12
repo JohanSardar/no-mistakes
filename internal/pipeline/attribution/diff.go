@@ -1,8 +1,29 @@
 package attribution
 
 import (
+	"context"
 	"strings"
+
+	"github.com/kunchenguid/no-mistakes/internal/git"
 )
+
+// diffAdded returns the lines from..to introduced, keyed by repo-relative path
+// in to's coordinates. The command pins the unified-diff shape the parser
+// reads: the maintainer's own git config (an external diff driver, mnemonic
+// or no prefixes, forced color, quoted non-ASCII paths, textconv) must not
+// change what counts as an added line.
+func diffAdded(ctx context.Context, dir, from, to string) (map[string]map[int]struct{}, error) {
+	out, err := git.Run(ctx, dir,
+		"-c", "core.quotePath=false",
+		"diff", "--no-color", "--no-ext-diff", "--no-textconv", "-M",
+		"--src-prefix=a/", "--dst-prefix=b/",
+		from, to,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return addedLines(out), nil
+}
 
 // addedLines maps slash-normalized paths to new-file line numbers that a
 // unified diff introduced. Context and deletion lines are not additions: a
@@ -87,46 +108,18 @@ func parseHunkNewStart(hunk string) int {
 	return n
 }
 
+// lineAddedIn matches the finding's repo-relative path exactly. A basename
+// match is not identity: same-named files in different directories are the
+// norm, and matching one would attribute a bug to a file nobody touched.
 func lineAddedIn(added map[string]map[int]struct{}, file string, line int) bool {
 	if file == "" || line <= 0 || added == nil {
 		return false
 	}
-	file = strings.ReplaceAll(file, "\\", "/")
-	if lines, ok := added[file]; ok {
-		_, hit := lines[line]
-		return hit
-	}
-	base := file
-	if i := strings.LastIndex(file, "/"); i >= 0 {
-		base = file[i+1:]
-	}
-	for path, lines := range added {
-		if path == base || strings.HasSuffix(path, "/"+base) {
-			_, hit := lines[line]
-			if hit {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func fileInDiff(added map[string]map[int]struct{}, file string) bool {
-	if file == "" || added == nil {
+	file = strings.TrimPrefix(strings.ReplaceAll(file, "\\", "/"), "./")
+	lines, ok := added[file]
+	if !ok {
 		return false
 	}
-	file = strings.ReplaceAll(file, "\\", "/")
-	if _, ok := added[file]; ok {
-		return true
-	}
-	base := file
-	if i := strings.LastIndex(file, "/"); i >= 0 {
-		base = file[i+1:]
-	}
-	for path := range added {
-		if path == base || strings.HasSuffix(path, "/"+base) {
-			return true
-		}
-	}
-	return false
+	_, hit := lines[line]
+	return hit
 }

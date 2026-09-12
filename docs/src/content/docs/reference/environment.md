@@ -3,19 +3,6 @@ title: Environment Variables
 description: All environment variables recognized by no-mistakes.
 ---
 
-## `NO_MISTAKES_WORKER_PROVENANCE`
-
-Optional JSON object describing the originating worker that produced the submitted commit, used as an input seam for Firstmate and other external callers.
-
-|         |          |
-| ------- | -------- |
-| Type    | `string` (JSON object) |
-| Default | (none)   |
-
-Recognized fields: `tool`, `model`, `provider`, `settings` (a JSON object), `task_id`, `external_run_id`. Empty or omitted fields are stored as unknown. Invalid JSON is refused. The CLI flag `--worker-provenance` wins when both are set. Do not put account identities, private paths, or personal presets in this value; it is recorded on the run and may appear in status output.
-
-The typed bug-fix signal is `--fixes-run`, not this variable.
-
 ## `NM_HOME`
 
 Override the data directory.

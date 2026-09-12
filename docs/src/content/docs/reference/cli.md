@@ -132,7 +132,7 @@ no-mistakes axi run --intent "the user's goal" --base-branch epic/foo
 | `--wait`        | `duration` | `8m`    | Maximum time for active-run lookup and run driving before the caller must reattach |
 | `--launch-nonce` | `string` | (none) | Non-secret correlation identifier for a durable pre-drive receipt; requires `--validation-generation` |
 | `--validation-generation` | `string` | (none) | Caller-selected validation generation bound to `--launch-nonce`; requires that flag |
-| `--worker-provenance` | `string` | (none) | JSON object of the originating worker identity (`tool`, `model`, `provider`, optional `settings`, `task_id`, `external_run_id`). Prefix with `@` to read a file. Unset fields stay unknown. Also accepted from [`NO_MISTAKES_WORKER_PROVENANCE`](/no-mistakes/reference/environment/#no_mistakes_worker_provenance) |
+| `--worker-provenance` | `string` | (none) | JSON object of the originating worker identity (`tool`, `model`, `provider`, optional `settings`, `task_id`, `external_run_id`). Unset fields stay unknown. Do not put account identities, private paths, or personal presets in it; it is recorded on the run and appears in status output |
 | `--fixes-run` | `string` | (none) | Typed signal that this run is a later bug-fix of an earlier run ID in the same repository. Free-text intent is never this signal |
 
 `--intent` is not a description of the diff.

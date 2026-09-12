@@ -12,7 +12,9 @@ import (
 
 // AttributionStep records observational bug attribution after Documentation
 // and before Lint. It never parks, never auto-fixes, and never restarts the
-// pipeline: review fixes are already re-reviewed.
+// pipeline: review fixes are already re-reviewed. It writes only the pre-Lint
+// snapshot; the executor reconciles the final record when the run ends
+// (attribution.ReconcileRun).
 type AttributionStep struct{}
 
 func (s *AttributionStep) Name() types.StepName { return types.StepAttribution }
@@ -29,7 +31,7 @@ func (s *AttributionStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOut
 	if err != nil {
 		return nil, fmt.Errorf("attribution snapshot: %w", err)
 	}
-	if err := persistAttribution(sctx, rec, true); err != nil {
+	if err := persistAttributionSnapshot(sctx, rec); err != nil {
 		return nil, err
 	}
 	sctx.Log(fmt.Sprintf("attribution snapshot %s: worker=%d pipeline=%d pre_existing=%d unknown=%d\n",
@@ -72,61 +74,17 @@ func attributionInput(sctx *pipeline.StepContext) (attribution.Input, error) {
 	return in, nil
 }
 
-func persistAttribution(sctx *pipeline.StepContext, rec *types.AttributionRecord, snapshot bool) error {
-	if sctx == nil || sctx.DB == nil || sctx.Run == nil || rec == nil {
+func persistAttributionSnapshot(sctx *pipeline.StepContext, rec *types.AttributionRecord) error {
+	if sctx.DB == nil || sctx.Run == nil || rec == nil {
 		return nil
 	}
 	raw, err := attribution.MarshalRecord(rec)
 	if err != nil {
 		return err
 	}
-	if snapshot {
-		if err := sctx.DB.SetRunAttributionSnapshot(sctx.Run.ID, raw); err != nil {
-			return err
-		}
-		sctx.Run.AttributionSnapshotJSON = &raw
-		return nil
-	}
-	if err := sctx.DB.SetRunAttributionFinal(sctx.Run.ID, raw); err != nil {
+	if err := sctx.DB.SetRunAttributionSnapshot(sctx.Run.ID, raw); err != nil {
 		return err
 	}
-	sctx.Run.AttributionJSON = &raw
-	return nil
-}
-
-func reconcileAttribution(sctx *pipeline.StepContext) error {
-	if sctx == nil || sctx.Run == nil {
-		return nil
-	}
-	in, err := attributionInput(sctx)
-	if err != nil {
-		return err
-	}
-	var snapshot *types.AttributionRecord
-	if sctx.Run.AttributionSnapshotJSON != nil {
-		snapshot, err = attribution.UnmarshalRecord(*sctx.Run.AttributionSnapshotJSON)
-		if err != nil {
-			return err
-		}
-	}
-	rec, err := attribution.Reconcile(sctx.Ctx, in, snapshot)
-	if err != nil {
-		return err
-	}
-	if err := persistAttribution(sctx, rec, false); err != nil {
-		return err
-	}
-	if sctx.DB == nil {
-		return nil
-	}
-	encoded, err := types.MarshalFindingsJSON(attribution.FindingsFrom(rec))
-	if err != nil {
-		return err
-	}
-	for _, step := range in.Steps {
-		if step != nil && step.StepName == types.StepAttribution && step.ID != "" {
-			return sctx.DB.SetStepFindings(step.ID, encoded)
-		}
-	}
+	sctx.Run.AttributionSnapshotJSON = &raw
 	return nil
 }

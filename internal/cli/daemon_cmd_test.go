@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"strings"
 	"testing"
 
 	"github.com/kunchenguid/no-mistakes/internal/types"
@@ -187,27 +186,18 @@ func TestFixesRunPushOptionRoundTrip(t *testing.T) {
 	}
 }
 
-func TestLoadWorkerProvenanceInput_EnvAndFile(t *testing.T) {
-	t.Setenv("NO_MISTAKES_WORKER_PROVENANCE", `{"tool":"codex"}`)
-	got, err := loadWorkerProvenanceInput("")
+func TestValidateWorkerProvenance(t *testing.T) {
+	got, err := validateWorkerProvenance(` {"tool":"grok","model":"grok-4.6"} `)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != `{"tool":"codex"}` {
-		t.Fatalf("env provenance = %q", got)
+	if got != `{"tool":"grok","model":"grok-4.6"}` {
+		t.Fatalf("provenance = %q", got)
 	}
-	path := t.TempDir() + "/prov.json"
-	if err := os.WriteFile(path, []byte(`{"tool":"grok","model":"grok-4.6"}`), 0o644); err != nil {
-		t.Fatal(err)
+	if got, err := validateWorkerProvenance(""); err != nil || got != "" {
+		t.Fatalf("empty flag = %q, %v", got, err)
 	}
-	got, err = loadWorkerProvenanceInput("@" + path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(got, `"tool":"grok"`) {
-		t.Fatalf("file provenance = %q", got)
-	}
-	if _, err := loadWorkerProvenanceInput("{"); err == nil {
+	if _, err := validateWorkerProvenance("{"); err == nil {
 		t.Fatal("invalid JSON was accepted")
 	}
 }

@@ -2,8 +2,6 @@ package db
 
 import (
 	"testing"
-
-	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
 func TestRunInsertHasNoAttribution(t *testing.T) {
@@ -22,7 +20,7 @@ func TestRunInsertHasNoAttribution(t *testing.T) {
 	}
 }
 
-func TestSetRunLaunchAttributionAndFixesRunJoin(t *testing.T) {
+func TestSetRunLaunchAttributionLeavesOriginatingRunUntouched(t *testing.T) {
 	d := openTestDB(t)
 	repo, _ := d.InsertRepo("/home/user/project", "git@github.com:user/project.git", "main")
 	original, err := d.InsertRun(repo.ID, "feature", "aaa", "bbb")
@@ -45,13 +43,6 @@ func TestSetRunLaunchAttributionAndFixesRunJoin(t *testing.T) {
 	}
 	if got.FixesRunID == nil || *got.FixesRunID != original.ID {
 		t.Fatalf("fixes_run_id = %v", got.FixesRunID)
-	}
-	linked, err := d.GetRunsByFixesRunID(repo.ID, original.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(linked) != 1 || linked[0].ID != fix.ID {
-		t.Fatalf("later corrections = %+v", linked)
 	}
 	// Originating run is unchanged.
 	orig, err := d.GetRun(original.ID)
@@ -86,5 +77,4 @@ func TestAttributionSnapshotIsNotRewrittenByFinal(t *testing.T) {
 	if got.AttributionJSON == nil || *got.AttributionJSON != `{"phase":"final","status":"complete","reconciled":true}` {
 		t.Fatalf("final = %v", got.AttributionJSON)
 	}
-	_ = types.AttributionPhaseSnapshot
 }

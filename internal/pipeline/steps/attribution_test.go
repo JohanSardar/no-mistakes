@@ -75,6 +75,12 @@ func TestAttributionStep_DoesNotParkOrRestart(t *testing.T) {
 	if parsed.Attribution.Phase != types.AttributionPhaseSnapshot {
 		t.Fatalf("phase = %s", parsed.Attribution.Phase)
 	}
+	if parsed.Attribution.Counts.OriginalWorker != 1 || parsed.Attribution.Counts.FixedBeforeShipping != 1 {
+		t.Fatalf("counts = %+v bugs=%+v gaps=%v", parsed.Attribution.Counts, parsed.Attribution.Bugs, parsed.Attribution.EvidenceGaps)
+	}
+	if parsed.Attribution.Bugs[0].Attribution != types.AttributionOriginalWorker {
+		t.Fatalf("attribution = %+v", parsed.Attribution.Bugs[0])
+	}
 }
 
 func TestAttributionStep_MissingMetadataIsNotCleanScore(t *testing.T) {

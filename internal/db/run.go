@@ -1144,26 +1144,3 @@ func (d *DB) SetRunAttributionFinal(id, attributionJSON string) error {
 	}
 	return nil
 }
-
-// GetRunsByFixesRunID returns later bug-fix runs that named originatingRunID
-// via the typed signal. Read-time join only: the originating run is not
-// mutated.
-func (d *DB) GetRunsByFixesRunID(repoID, originatingRunID string) ([]*Run, error) {
-	rows, err := d.sql.Query(
-		`SELECT `+runColumns+` FROM runs WHERE repo_id = ? AND fixes_run_id = ? ORDER BY created_at ASC, id ASC`,
-		repoID, originatingRunID,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("get runs by fixes_run_id: %w", err)
-	}
-	defer rows.Close()
-	var runs []*Run
-	for rows.Next() {
-		r := &Run{}
-		if err := scanRun(rows, r); err != nil {
-			return nil, fmt.Errorf("scan run: %w", err)
-		}
-		runs = append(runs, r)
-	}
-	return runs, rows.Err()
-}

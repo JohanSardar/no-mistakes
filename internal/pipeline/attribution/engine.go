@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
@@ -13,6 +14,11 @@ import (
 
 // Input is the durable pipeline/persistence view the engine needs. Tests drive
 // it with real temporary Git repositories and recorded step/round rows.
+//
+// Run.BaseSHA is deliberately not read: the daemon stores the gate's previous
+// head there (the zero SHA on a first push, the submitted head itself on an
+// axi-run fallback), never the branch base. The engine resolves the base as
+// every other step does, by merge-base against Repo.DefaultBranch.
 type Input struct {
 	WorkDir string
 	Run     *db.Run
@@ -30,7 +36,9 @@ func Snapshot(ctx context.Context, in Input) (*types.AttributionRecord, error) {
 }
 
 // Reconcile produces the final record from a snapshot plus later pipeline
-// mutations (lint/CI/rebase). The snapshot itself is not rewritten.
+// mutations (lint/CI/rebase). The snapshot itself is not rewritten: a bug it
+// already attributed keeps that attribution, and only its outcome is re-read
+// from the rounds.
 func Reconcile(ctx context.Context, in Input, snapshot *types.AttributionRecord) (*types.AttributionRecord, error) {
 	if snapshot == nil {
 		return unavailableRecord(in, types.AttributionPhaseFinal, []string{"no attribution snapshot; refusing a clean score"}), nil
@@ -45,9 +53,7 @@ func build(ctx context.Context, in Input, phase string, snapshot *types.Attribut
 		rec.EvidenceGaps = append(rec.EvidenceGaps, "run metadata is missing")
 		return rec, nil
 	}
-
-	workerAdded, pipelineAdded, gaps := loadChangeMaps(ctx, in)
-	rec.EvidenceGaps = append(rec.EvidenceGaps, gaps...)
+	loc := newLocator(ctx, in)
 
 	preLint := map[types.StepName]bool{
 		types.StepIntent: true, types.StepRebase: true, types.StepReview: true,
@@ -60,7 +66,15 @@ func build(ctx context.Context, in Input, phase string, snapshot *types.Attribut
 		return name != types.StepAttribution
 	}
 
+	snapshotBugs := make(map[string]types.AttributedBug)
+	if snapshot != nil {
+		for _, bug := range snapshot.Bugs {
+			snapshotBugs[bug.Fingerprint] = bug
+		}
+	}
+
 	byFingerprint := make(map[string]*types.AttributedBug)
+	var order []string
 	var nonBugs []types.NonBugChange
 	for _, step := range in.Steps {
 		if step == nil || !includeStep(step.StepName) {
@@ -71,22 +85,17 @@ func build(ctx context.Context, in Input, phase string, snapshot *types.Attribut
 				rec.EvidenceGaps = append(rec.EvidenceGaps, fmt.Sprintf("%s step %s; not treated as a clean score", step.StepName, step.Status))
 			}
 		}
-		rounds := in.Rounds[step.ID]
-		for _, cf := range classifyStepFindings(step, rounds) {
+		for _, cf := range classifyStepFindings(step, in.Rounds[step.ID]) {
+			fp := fingerprint(cf.Finding)
 			if cf.Kind != types.ChangeKindBug {
 				nonBugs = append(nonBugs, types.NonBugChange{
-					ID: cf.Finding.ID, Fingerprint: fingerprint(cf.Finding),
+					ID: cf.Finding.ID, Fingerprint: fp,
 					File: cf.Finding.File, Line: cf.Finding.Line,
 					Description: cf.Finding.Description, SourceStep: cf.SourceStep, Kind: cf.Kind,
 				})
 				continue
 			}
-			fp := fingerprint(cf.Finding)
-			if existing, ok := byFingerprint[fp]; ok {
-				if cf.Fixed {
-					existing.Outcome = types.BugOutcomeFixedBeforeShipping
-					existing.FixedInStep = cf.SourceStep
-				}
+			if _, ok := byFingerprint[fp]; ok {
 				continue
 			}
 			bug := types.AttributedBug{
@@ -96,50 +105,51 @@ func build(ctx context.Context, in Input, phase string, snapshot *types.Attribut
 				Line:        cf.Finding.Line,
 				Description: cf.Finding.Description,
 				SourceStep:  cf.SourceStep,
+				Outcome:     cf.Outcome,
 			}
-			bug.Attribution, bug.Confidence, bug.Evidence = attributeBug(cf, workerAdded, pipelineAdded)
-			if cf.Fixed {
-				bug.Outcome = types.BugOutcomeFixedBeforeShipping
+			if cf.Outcome == types.BugOutcomeFixedBeforeShipping {
 				bug.FixedInStep = cf.SourceStep
+			}
+			if prior, ok := snapshotBugs[fp]; ok {
+				bug.Attribution, bug.Confidence, bug.Evidence = prior.Attribution, prior.Confidence, prior.Evidence
 			} else {
-				bug.Outcome = types.BugOutcomeStillOpen
+				bug.Attribution, bug.Confidence, bug.Evidence = loc.attribute(cf)
 			}
 			byFingerprint[fp] = &bug
+			order = append(order, fp)
 		}
 	}
 
 	if snapshot != nil {
-		for i := range snapshot.Bugs {
-			fp := snapshot.Bugs[i].Fingerprint
-			if fp == "" {
-				fp = snapshot.Bugs[i].ID
+		for _, bug := range snapshot.Bugs {
+			if _, ok := byFingerprint[bug.Fingerprint]; ok {
+				continue
 			}
-			if _, ok := byFingerprint[fp]; !ok {
-				copied := snapshot.Bugs[i]
-				byFingerprint[fp] = &copied
-			}
+			copied := bug
+			byFingerprint[bug.Fingerprint] = &copied
+			order = append(order, bug.Fingerprint)
 		}
-		for _, nb := range snapshot.NonBugs {
-			nonBugs = append(nonBugs, nb)
-		}
+		nonBugs = append(nonBugs, snapshot.NonBugs...)
 		rec.SnapshotHeadSHA = snapshot.SnapshotHeadSHA
 		rec.Reconciled = strings.TrimSpace(in.HeadSHA) != "" && in.HeadSHA != snapshot.SnapshotHeadSHA
 		if rec.Reconciled {
 			rec.EvidenceGaps = append(rec.EvidenceGaps, "reconciled commits after the pre-lint snapshot")
 		}
-		if snapshot.BugFix != nil && rec.BugFix == nil {
-			copied := *snapshot.BugFix
-			rec.BugFix = &copied
-		}
 	}
+	rec.EvidenceGaps = append(rec.EvidenceGaps, loc.gaps...)
 
-	for _, bug := range byFingerprint {
+	shipped := phase == types.AttributionPhaseFinal && in.Run.Status == types.RunCompleted
+	for _, fp := range order {
+		bug := byFingerprint[fp]
+		if shipped && bug.Outcome == types.BugOutcomeStillOpen {
+			bug.Outcome = types.BugOutcomeEscaped
+		}
 		rec.Bugs = append(rec.Bugs, *bug)
 	}
 	rec.NonBugs = dedupeNonBugs(nonBugs)
-	sortBugs(rec)
+	sort.SliceStable(rec.Bugs, func(i, j int) bool { return bugLess(rec.Bugs[i], rec.Bugs[j]) })
 	types.RecalculateAttributionCounts(rec)
-	attachBugFixLink(in, rec)
+	attachBugFixLink(in, rec, phase)
 	setStatus(rec)
 	return rec, nil
 }
@@ -186,133 +196,214 @@ func newRecord(in Input, phase string) *types.AttributionRecord {
 	return rec
 }
 
-func loadChangeMaps(ctx context.Context, in Input) (worker, pipeline map[string]map[int]struct{}, gaps []string) {
-	if strings.TrimSpace(in.WorkDir) == "" {
-		return nil, nil, []string{"worktree path is missing"}
-	}
-	submitted := ""
-	base := ""
-	head := strings.TrimSpace(in.HeadSHA)
-	if in.Run != nil {
-		if in.Run.SubmittedHeadSHA != nil {
-			submitted = strings.TrimSpace(*in.Run.SubmittedHeadSHA)
-		}
-		base = strings.TrimSpace(in.Run.BaseSHA)
-	}
-	if submitted == "" {
-		gaps = append(gaps, "submitted head SHA is missing")
-	} else if !commitExists(ctx, in.WorkDir, submitted) {
-		gaps = append(gaps, "submitted head SHA is not present in git")
-		submitted = ""
-	}
-	if head == "" || !commitExists(ctx, in.WorkDir, head) {
-		if live, err := git.HeadSHA(ctx, in.WorkDir); err == nil {
-			head = strings.TrimSpace(live)
-		}
-	}
-	if base != "" && (git.IsZeroSHA(base) || !commitExists(ctx, in.WorkDir, base)) {
-		base = ""
-	}
-
-	if submitted != "" && base != "" && commitExists(ctx, in.WorkDir, base) {
-		if diff, err := git.Diff(ctx, in.WorkDir, base, submitted); err == nil {
-			worker = addedLines(diff)
-		} else {
-			gaps = append(gaps, "could not diff base..submitted")
-		}
-	} else if submitted != "" && base == "" {
-		gaps = append(gaps, "base SHA is missing; worker vs pre-existing split is unknown")
-	}
-
-	if submitted != "" && head != "" {
-		if !isAncestor(ctx, in.WorkDir, submitted, head) {
-			gaps = append(gaps, "submitted head is not an ancestor of the current head after rewrite; git location is unknown")
-		} else if diff, err := git.Diff(ctx, in.WorkDir, submitted, head); err == nil {
-			pipeline = addedLines(diff)
-		} else {
-			gaps = append(gaps, "could not diff submitted..head")
-		}
-	}
-
-	// Refine pipeline map with fix-round ranges when SHAs survive rewrite.
-	for _, step := range in.Steps {
-		for _, round := range in.Rounds[step.ID] {
-			if round == nil || !round.IsFixRound() || round.StartingHeadSHA == nil {
-				continue
-			}
-			from := strings.TrimSpace(*round.StartingHeadSHA)
-			to := head
-			if round.ReviewedHeadSHA != nil && strings.TrimSpace(*round.ReviewedHeadSHA) != "" {
-				to = strings.TrimSpace(*round.ReviewedHeadSHA)
-			}
-			if !commitExists(ctx, in.WorkDir, from) || !commitExists(ctx, in.WorkDir, to) {
-				continue
-			}
-			diff, err := git.Diff(ctx, in.WorkDir, from, to)
-			if err != nil {
-				continue
-			}
-			more := addedLines(diff)
-			if pipeline == nil {
-				pipeline = more
-				continue
-			}
-			for path, lines := range more {
-				if pipeline[path] == nil {
-					pipeline[path] = lines
-					continue
-				}
-				for line := range lines {
-					pipeline[path][line] = struct{}{}
-				}
-			}
-		}
-	}
-	return worker, pipeline, gaps
+// locator answers "who added this line" for a finding in the coordinates of
+// the commit that finding was reviewed at. Two diffs, both expressed at that
+// commit, partition its lines: workerHead..locate is what the pipeline wrote
+// after submission, base..locate is everything the branch introduced, and the
+// remainder of the branch set is the original worker's. Neither diff alone is
+// causation; only a confirmed finding on such a line is attributed.
+type locator struct {
+	ctx           context.Context
+	dir           string
+	head          string
+	submitted     string
+	defaultBranch string
+	// reviewHeads are the commits review rounds examined, in round order.
+	// When a rebase rewrote the submitted head before review, the first of
+	// these that is an ancestor of a finding's commit stands in for it.
+	reviewHeads []string
+	anchors     map[string]*anchor
+	diffs       map[string]map[string]map[int]struct{}
+	unavailable string
+	gaps        []string
 }
 
-func attributeBug(cf classifiedFinding, worker, pipeline map[string]map[int]struct{}) (bucket, confidence string, evidence []string) {
+type anchor struct {
+	workerHead string
+	base       string
+	rewritten  bool
+	err        string
+}
+
+func newLocator(ctx context.Context, in Input) *locator {
+	l := &locator{ctx: ctx, dir: strings.TrimSpace(in.WorkDir), anchors: map[string]*anchor{}, diffs: map[string]map[string]map[int]struct{}{}}
+	if in.Repo != nil {
+		l.defaultBranch = strings.TrimSpace(in.Repo.DefaultBranch)
+	}
+	if l.dir == "" {
+		l.unavailable = "worktree path is missing; git location is unknown"
+		l.gaps = append(l.gaps, l.unavailable)
+		return l
+	}
+	if in.Run != nil && in.Run.SubmittedHeadSHA != nil {
+		l.submitted = strings.TrimSpace(*in.Run.SubmittedHeadSHA)
+	}
+	switch {
+	case l.submitted == "":
+		l.unavailable = "submitted head SHA is missing; git location is unknown"
+	case !commitExists(ctx, l.dir, l.submitted):
+		l.unavailable = "submitted head SHA is not present in git; git location is unknown"
+	}
+	if l.unavailable != "" {
+		l.gaps = append(l.gaps, l.unavailable)
+		return l
+	}
+	l.head = strings.TrimSpace(in.HeadSHA)
+	if l.head == "" || !commitExists(ctx, l.dir, l.head) {
+		if live, err := git.HeadSHA(ctx, l.dir); err == nil {
+			l.head = strings.TrimSpace(live)
+		}
+	}
+	for _, step := range in.Steps {
+		if step == nil || step.StepName != types.StepReview {
+			continue
+		}
+		for _, round := range in.Rounds[step.ID] {
+			if round == nil {
+				continue
+			}
+			if sha := strings.TrimSpace(deref(round.ReviewedHeadSHA)); sha != "" {
+				l.reviewHeads = append(l.reviewHeads, sha)
+			}
+		}
+	}
+	return l
+}
+
+func (l *locator) attribute(cf classifiedFinding) (bucket, confidence string, evidence []string) {
 	file, line := cf.Finding.File, cf.Finding.Line
 	if file == "" || line <= 0 {
 		return types.AttributionUnknown, types.AttributionConfidenceUnknown, []string{"finding has no file:line; refusing to infer from the diff"}
 	}
-	inPipeline := lineAddedIn(pipeline, file, line)
-	inWorker := lineAddedIn(worker, file, line)
-	switch {
-	case inPipeline && !inWorker:
-		return types.AttributionPipeline, types.AttributionConfidenceHigh, []string{"confirmed finding line was introduced after submission"}
-	case inWorker && !inPipeline:
-		return types.AttributionOriginalWorker, types.AttributionConfidenceHigh, []string{"confirmed finding line was introduced in the submitted change"}
-	case inWorker && inPipeline:
-		return types.AttributionUnknown, types.AttributionConfidenceLow, []string{"line appears in both submitted and post-submission diffs"}
-	case fileInDiff(worker, file) || fileInDiff(pipeline, file):
-		return types.AttributionPreExisting, types.AttributionConfidenceMedium, []string{"file was touched but the finding line was not an added line"}
-	default:
-		return types.AttributionPreExisting, types.AttributionConfidenceMedium, []string{"confirmed finding line was not added in the submitted or pipeline diffs"}
+	if l.unavailable != "" {
+		return types.AttributionUnknown, types.AttributionConfidenceUnknown, []string{l.unavailable}
 	}
+	locate := cf.LocateSHA
+	if locate == "" || !commitExists(l.ctx, l.dir, locate) {
+		locate = l.head
+	}
+	if locate == "" {
+		return types.AttributionUnknown, types.AttributionConfidenceUnknown, []string{"no commit records where the finding was located"}
+	}
+	a := l.anchorFor(locate)
+	if a.err != "" {
+		return types.AttributionUnknown, types.AttributionConfidenceUnknown, []string{a.err}
+	}
+	confidence = types.AttributionConfidenceHigh
+	if a.rewritten {
+		confidence = types.AttributionConfidenceMedium
+	}
+	pipelineAdded, err := l.added(a.workerHead, locate)
+	if err != nil {
+		return types.AttributionUnknown, types.AttributionConfidenceUnknown, []string{fmt.Sprintf("could not diff %s..%s", short(a.workerHead), short(locate))}
+	}
+	if lineAddedIn(pipelineAdded, file, line) {
+		return types.AttributionPipeline, confidence, []string{fmt.Sprintf("line %s:%d at %s was added after %s", file, line, short(locate), short(a.workerHead))}
+	}
+	if a.base == "" {
+		return types.AttributionUnknown, types.AttributionConfidenceUnknown, []string{fmt.Sprintf("branch base of %s could not be resolved against %q; worker vs pre-existing split is unknown", short(a.workerHead), l.defaultBranch)}
+	}
+	branchAdded, err := l.added(a.base, locate)
+	if err != nil {
+		return types.AttributionUnknown, types.AttributionConfidenceUnknown, []string{fmt.Sprintf("could not diff %s..%s", short(a.base), short(locate))}
+	}
+	if lineAddedIn(branchAdded, file, line) {
+		return types.AttributionOriginalWorker, confidence, []string{fmt.Sprintf("line %s:%d at %s was added by the submitted change (%s..%s)", file, line, short(locate), short(a.base), short(a.workerHead))}
+	}
+	return types.AttributionPreExisting, types.AttributionConfidenceMedium, []string{fmt.Sprintf("line %s:%d at %s predates the branch base %s", file, line, short(locate), short(a.base))}
 }
 
-func attachBugFixLink(in Input, rec *types.AttributionRecord) {
+func (l *locator) anchorFor(locate string) *anchor {
+	if a, ok := l.anchors[locate]; ok {
+		return a
+	}
+	a := &anchor{}
+	l.anchors[locate] = a
+	switch {
+	case isAncestor(l.ctx, l.dir, l.submitted, locate):
+		a.workerHead = l.submitted
+	default:
+		for _, sha := range l.reviewHeads {
+			if isAncestor(l.ctx, l.dir, sha, locate) {
+				a.workerHead, a.rewritten = sha, true
+				break
+			}
+		}
+	}
+	if a.workerHead == "" {
+		a.err = fmt.Sprintf("submitted head is not an ancestor of %s after a history rewrite; git location is unknown", short(locate))
+		l.gaps = appendUnique(l.gaps, a.err)
+		return a
+	}
+	if a.rewritten {
+		l.gaps = appendUnique(l.gaps, fmt.Sprintf("submitted head was rewritten before review; worker anchor for %s is the head review first examined (%s)", short(locate), short(a.workerHead)))
+	}
+	a.base = l.mergeBase(a.workerHead)
+	if a.base == "" {
+		l.gaps = appendUnique(l.gaps, fmt.Sprintf("branch base of %s could not be resolved against %q; worker vs pre-existing split is unknown", short(a.workerHead), l.defaultBranch))
+	}
+	return a
+}
+
+func (l *locator) mergeBase(sha string) string {
+	if l.defaultBranch == "" {
+		return ""
+	}
+	for _, ref := range []string{"origin/" + l.defaultBranch, l.defaultBranch} {
+		mb, err := git.Run(l.ctx, l.dir, "merge-base", sha, ref)
+		if err == nil && strings.TrimSpace(mb) != "" {
+			return strings.TrimSpace(mb)
+		}
+	}
+	return ""
+}
+
+func (l *locator) added(from, to string) (map[string]map[int]struct{}, error) {
+	key := from + ".." + to
+	if cached, ok := l.diffs[key]; ok {
+		return cached, nil
+	}
+	added, err := diffAdded(l.ctx, l.dir, from, to)
+	if err != nil {
+		return nil, err
+	}
+	l.diffs[key] = added
+	return added, nil
+}
+
+// attachBugFixLink confirms the typed fixes_run_id link only once the repair
+// actually shipped: review and test completed and the run itself completed.
+// A snapshot is taken mid-run, and a failed or cancelled run never shipped,
+// so both stay unconfirmed with the reason recorded.
+func attachBugFixLink(in Input, rec *types.AttributionRecord, phase string) {
 	if rec.BugFix == nil {
 		return
 	}
-	reviewOK, testOK := stepCompleted(in, types.StepReview), stepCompleted(in, types.StepTest)
 	rec.BugFix.Evidence = []string{"typed fixes_run_id signal"}
-	if reviewOK && testOK {
-		rec.BugFix.Confirmed = true
-		rec.BugFix.Confidence = types.AttributionConfidenceHigh
-		rec.BugFix.Evidence = append(rec.BugFix.Evidence, "review completed", "test completed")
-		return
-	}
 	rec.BugFix.Confirmed = false
 	rec.BugFix.Confidence = types.AttributionConfidenceUnknown
-	if !reviewOK {
-		rec.BugFix.Evidence = append(rec.BugFix.Evidence, "review did not complete; repair is unconfirmed")
-		rec.EvidenceGaps = append(rec.EvidenceGaps, "bug-fix run did not complete review")
+	var unmet []string
+	if !stepCompleted(in, types.StepReview) {
+		unmet = append(unmet, "review did not complete")
 	}
-	if !testOK {
-		rec.BugFix.Evidence = append(rec.BugFix.Evidence, "test did not complete; repair is unconfirmed")
-		rec.EvidenceGaps = append(rec.EvidenceGaps, "bug-fix run did not complete test")
+	if !stepCompleted(in, types.StepTest) {
+		unmet = append(unmet, "test did not complete")
+	}
+	switch {
+	case phase != types.AttributionPhaseFinal:
+		unmet = append(unmet, "run has not finished")
+	case in.Run.Status != types.RunCompleted:
+		unmet = append(unmet, fmt.Sprintf("run %s; repair did not ship", in.Run.Status))
+	}
+	if len(unmet) == 0 {
+		rec.BugFix.Confirmed = true
+		rec.BugFix.Confidence = types.AttributionConfidenceHigh
+		rec.BugFix.Evidence = append(rec.BugFix.Evidence, "review completed", "test completed", "run completed")
+		return
+	}
+	for _, reason := range unmet {
+		rec.BugFix.Evidence = append(rec.BugFix.Evidence, reason+"; repair is unconfirmed")
+		rec.EvidenceGaps = append(rec.EvidenceGaps, "bug-fix run: "+reason)
 	}
 }
 
@@ -371,6 +462,13 @@ func isAncestor(ctx context.Context, dir, anc, desc string) bool {
 	return err == nil
 }
 
+func short(sha string) string {
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	return sha
+}
+
 func deref(s *string) string {
 	if s == nil {
 		return ""
@@ -404,21 +502,6 @@ func dedupeNonBugs(in []types.NonBugChange) []types.NonBugChange {
 	return out
 }
 
-func sortBugs(rec *types.AttributionRecord) {
-	if rec == nil {
-		return
-	}
-	// Stable, deterministic: source step order then file:line then id.
-	bugs := rec.Bugs
-	for i := 0; i < len(bugs); i++ {
-		for j := i + 1; j < len(bugs); j++ {
-			if bugLess(bugs[j], bugs[i]) {
-				bugs[i], bugs[j] = bugs[j], bugs[i]
-			}
-		}
-	}
-}
-
 func bugLess(a, b types.AttributedBug) bool {
 	if a.SourceStep.Order() != b.SourceStep.Order() {
 		return a.SourceStep.Order() < b.SourceStep.Order()
@@ -429,7 +512,10 @@ func bugLess(a, b types.AttributedBug) bool {
 	if a.Line != b.Line {
 		return a.Line < b.Line
 	}
-	return a.ID < b.ID
+	if a.ID != b.ID {
+		return a.ID < b.ID
+	}
+	return a.Fingerprint < b.Fingerprint
 }
 
 // MarshalRecord is the persistence encoding for run columns and findings.
@@ -528,8 +614,8 @@ func UnmarshalRecord(raw string) (*types.AttributionRecord, error) {
 func FindingsFrom(rec *types.AttributionRecord) types.Findings {
 	summary := "attribution unavailable"
 	if rec != nil {
-		summary = fmt.Sprintf("attribution %s %s: worker=%d pipeline=%d pre_existing=%d unknown=%d non_bugs=%d",
-			rec.Phase, rec.Status, rec.Counts.OriginalWorker, rec.Counts.Pipeline, rec.Counts.PreExisting, rec.Counts.Unknown, rec.Counts.NonBugs)
+		summary = fmt.Sprintf("attribution %s %s: worker=%d pipeline=%d pre_existing=%d unknown=%d non_bugs=%d fixed=%d escaped=%d",
+			rec.Phase, rec.Status, rec.Counts.OriginalWorker, rec.Counts.Pipeline, rec.Counts.PreExisting, rec.Counts.Unknown, rec.Counts.NonBugs, rec.Counts.FixedBeforeShipping, rec.Counts.Escaped)
 	}
 	return types.Findings{
 		Summary:       summary,
