@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -107,9 +108,6 @@ func build(ctx context.Context, in Input, phase string, snapshot *types.Attribut
 				SourceStep:  cf.SourceStep,
 				Outcome:     cf.Outcome,
 			}
-			if cf.Outcome == types.BugOutcomeFixedBeforeShipping {
-				bug.FixedInStep = cf.SourceStep
-			}
 			if prior, ok := snapshotBugs[fp]; ok {
 				bug.Attribution, bug.Confidence, bug.Evidence = prior.Attribution, prior.Confidence, prior.Evidence
 			} else {
@@ -179,7 +177,7 @@ func newRecord(in Input, phase string) *types.AttributionRecord {
 		if in.Run.FixesRunID != nil {
 			id := strings.TrimSpace(*in.Run.FixesRunID)
 			if id != "" {
-				rec.BugFix = &types.BugFixLink{OriginatingRunID: id, Confidence: types.AttributionConfidenceUnknown}
+				rec.BugFix = &types.BugFixLink{OriginatingRunID: id}
 			}
 		}
 	}
@@ -277,6 +275,13 @@ func (l *locator) attribute(cf classifiedFinding) (bucket, confidence string, ev
 	}
 	if l.unavailable != "" {
 		return types.AttributionUnknown, types.AttributionConfidenceUnknown, []string{l.unavailable}
+	}
+	if filepath.IsAbs(file) {
+		rel, err := filepath.Rel(l.dir, file)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return types.AttributionUnknown, types.AttributionConfidenceUnknown, []string{fmt.Sprintf("finding path %s is outside the worktree", file)}
+		}
+		file = filepath.ToSlash(rel)
 	}
 	locate := cf.LocateSHA
 	if locate == "" || !commitExists(l.ctx, l.dir, locate) {
@@ -381,7 +386,6 @@ func attachBugFixLink(in Input, rec *types.AttributionRecord, phase string) {
 	}
 	rec.BugFix.Evidence = []string{"typed fixes_run_id signal"}
 	rec.BugFix.Confirmed = false
-	rec.BugFix.Confidence = types.AttributionConfidenceUnknown
 	var unmet []string
 	if !stepCompleted(in, types.StepReview) {
 		unmet = append(unmet, "review did not complete")
@@ -397,7 +401,6 @@ func attachBugFixLink(in Input, rec *types.AttributionRecord, phase string) {
 	}
 	if len(unmet) == 0 {
 		rec.BugFix.Confirmed = true
-		rec.BugFix.Confidence = types.AttributionConfidenceHigh
 		rec.BugFix.Evidence = append(rec.BugFix.Evidence, "review completed", "test completed", "run completed")
 		return
 	}
@@ -530,9 +533,11 @@ func MarshalRecord(rec *types.AttributionRecord) (string, error) {
 	return string(raw), nil
 }
 
-// ReconcileRun loads the run's steps and writes the final attribution record.
-// A missing snapshot is stored as unavailable rather than a clean score.
-// Skip this when the run never had an attribution step (legacy).
+// ReconcileRun loads the run's steps and writes the final attribution record
+// to runs.attribution_json, the record's only store; the attribution step's
+// findings carry just the summary line. A missing snapshot is stored as
+// unavailable rather than a clean score. Skip this when the run never had an
+// attribution step (legacy).
 func ReconcileRun(ctx context.Context, database *db.DB, run *db.Run, repo *db.Repo, workDir string) error {
 	if database == nil || run == nil {
 		return nil
@@ -611,6 +616,8 @@ func UnmarshalRecord(raw string) (*types.AttributionRecord, error) {
 	return &rec, nil
 }
 
+// FindingsFrom renders the step's summary findings for the pipeline summary.
+// The record itself lives on the run columns and is not duplicated here.
 func FindingsFrom(rec *types.AttributionRecord) types.Findings {
 	summary := "attribution unavailable"
 	if rec != nil {
@@ -621,6 +628,5 @@ func FindingsFrom(rec *types.AttributionRecord) types.Findings {
 		Summary:       summary,
 		RiskLevel:     "low",
 		RiskRationale: "observational attribution; does not gate the run",
-		Attribution:   rec,
 	}
 }

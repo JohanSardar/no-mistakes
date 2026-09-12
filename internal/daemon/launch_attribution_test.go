@@ -73,9 +73,10 @@ func TestPushReceivedRefusesBadFixesRunBeforeSupersedingOrCreatingARun(t *testin
 	}
 }
 
-// Entry provenance supplied on a push is recorded on the run, and a rerun
-// that supplies none inherits the selected run's worker identity and typed
-// bug-fix link so the repeated attribution keeps its provenance.
+// Entry provenance supplied on a push is recorded on the run. A rerun that
+// supplies none inherits only the typed bug-fix link: its submitted head is
+// the gate head with the earlier run's pipeline commits in it, so the worker
+// identity stays unknown unless the caller supplies it again.
 func TestLaunchAttributionIsRecordedAndInheritedByRerun(t *testing.T) {
 	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step { return []pipeline.Step{&mockPassStep{name: types.StepReview}} })
 	repo, head := setupTestGitRepo(t, p, d, "launch-attribution-repo")
@@ -124,11 +125,11 @@ func TestLaunchAttributionIsRecordedAndInheritedByRerun(t *testing.T) {
 	if inherited.FixesRunID == nil || *inherited.FixesRunID != original.ID {
 		t.Fatalf("rerun lost fixes_run_id: %v", inherited.FixesRunID)
 	}
-	if derefString(inherited.WorkerProvenanceJSON) != derefString(fixRun.WorkerProvenanceJSON) {
-		t.Fatalf("rerun worker provenance = %v, want %v", inherited.WorkerProvenanceJSON, fixRun.WorkerProvenanceJSON)
+	if inherited.WorkerProvenanceJSON != nil {
+		t.Fatalf("rerun re-asserted the earlier worker identity over the gate head: %v", *inherited.WorkerProvenanceJSON)
 	}
 
-	// An explicit value on the rerun wins over the inherited one.
+	// An explicit value on the rerun is recorded as supplied.
 	var override ipc.RerunResult
 	if err := client.Call(ipc.MethodRerun, &ipc.RerunParams{
 		RepoID: repo.ID, Branch: "main", WorkerProvenance: json.RawMessage(`{"tool":"codex"}`),

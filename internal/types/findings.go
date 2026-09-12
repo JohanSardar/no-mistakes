@@ -272,26 +272,21 @@ type Findings struct {
 	RiskLevel      string         `json:"risk_level"`
 	RiskRationale  string         `json:"risk_rationale"`
 	RiskScope      string         `json:"risk_scope,omitempty"`
-	// Attribution is the observational bug-attribution record written by the
-	// attribution step. Empty on every other step and on runs recorded before
-	// the feature existed.
-	Attribution *AttributionRecord `json:"attribution,omitempty"`
 }
 
 type findingsWire struct {
-	Items          []Finding          `json:"findings"`
-	Legacy         []Finding          `json:"items"`
-	Summary        string             `json:"summary"`
-	Tested         []string           `json:"tested"`
-	TestingSummary string             `json:"testing_summary"`
-	Artifacts      []TestArtifact     `json:"artifacts"`
-	Scenarios      []TestScenario     `json:"scenarios"`
-	Verdict        string             `json:"verdict"`
-	TestedHeadSHA  string             `json:"tested_head_sha"`
-	RiskLevel      string             `json:"risk_level"`
-	RiskRationale  string             `json:"risk_rationale"`
-	RiskScope      string             `json:"risk_scope"`
-	Attribution    *AttributionRecord `json:"attribution"`
+	Items          []Finding      `json:"findings"`
+	Legacy         []Finding      `json:"items"`
+	Summary        string         `json:"summary"`
+	Tested         []string       `json:"tested"`
+	TestingSummary string         `json:"testing_summary"`
+	Artifacts      []TestArtifact `json:"artifacts"`
+	Scenarios      []TestScenario `json:"scenarios"`
+	Verdict        string         `json:"verdict"`
+	TestedHeadSHA  string         `json:"tested_head_sha"`
+	RiskLevel      string         `json:"risk_level"`
+	RiskRationale  string         `json:"risk_rationale"`
+	RiskScope      string         `json:"risk_scope"`
 }
 
 // ParseFindingsJSON decodes findings JSON, accepting current and legacy item
@@ -317,7 +312,6 @@ func ParseFindingsJSON(raw string) (Findings, error) {
 		RiskLevel:      wire.RiskLevel,
 		RiskRationale:  wire.RiskRationale,
 		RiskScope:      wire.RiskScope,
-		Attribution:    wire.Attribution,
 	}, nil
 }
 

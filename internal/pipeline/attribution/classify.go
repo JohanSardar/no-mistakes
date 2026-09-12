@@ -44,20 +44,29 @@ func classifyStepFindings(step *db.StepResult, rounds []*db.StepRound) []classif
 		if round == nil {
 			continue
 		}
+		findings := parseFindings(round.FindingsJSON)
+		locate := strings.TrimSpace(deref(round.ReviewedHeadSHA))
+		if locate == "" {
+			locate = strings.TrimSpace(findings.TestedHeadSHA)
+		}
 		parsed = append(parsed, roundFindings{
-			items:    parseFindingItems(round.FindingsJSON),
+			items:    withUserFindings(findings.Items, parseFindings(round.UserFindingsJSON).Items),
 			selected: selectedIDs(round),
-			locate:   deref(round.ReviewedHeadSHA),
+			locate:   locate,
 			isFix:    round.IsFixRound(),
 			repair:   round.RepairPublished,
 		})
 	}
 	if len(parsed) == 0 {
-		parsed = []roundFindings{{items: parseFindingItems(step.FindingsJSON), selected: map[string]bool{}}}
+		parsed = []roundFindings{{items: parseFindings(step.FindingsJSON).Items, selected: map[string]bool{}}}
 	}
 	final := make(map[string]bool)
+	finalLocations := make(map[string]bool)
 	for _, item := range parsed[len(parsed)-1].items {
 		final[fingerprint(item)] = true
+		if loc := location(item); loc != "" {
+			finalLocations[loc] = true
+		}
 	}
 
 	var out []classifiedFinding
@@ -74,7 +83,9 @@ func classifyStepFindings(step *db.StepResult, rounds []*db.StepRound) []classif
 			fp := fingerprint(item)
 			selected := rf.selected[item.ID]
 			kind := findingKind(step.StepName, item, selected, repairFollows)
-			fixed := selected && fixFollows && !final[fp]
+			// A reworded re-report at the same file:line is not proof the
+			// fix landed; the outcome stays unknown rather than crediting it.
+			fixed := selected && fixFollows && !final[fp] && !finalLocations[location(item)]
 			if j, ok := index[fp]; ok {
 				if kind == types.ChangeKindBug {
 					out[j].Kind = kind
@@ -84,7 +95,7 @@ func classifyStepFindings(step *db.StepResult, rounds []*db.StepRound) []classif
 				}
 				continue
 			}
-			cf := classifiedFinding{Finding: item, SourceStep: step.StepName, Kind: kind, LocateSHA: strings.TrimSpace(rf.locate)}
+			cf := classifiedFinding{Finding: item, SourceStep: step.StepName, Kind: kind, LocateSHA: rf.locate}
 			switch {
 			case final[fp]:
 				cf.Outcome = types.BugOutcomeStillOpen
@@ -128,7 +139,7 @@ func findingKind(step types.StepName, item types.Finding, selected, repairPublis
 		return types.ChangeKindOther
 	}
 	sev := types.NormalizeFindingSeverity(item.Severity)
-	if sev != types.FindingSeverityError && sev != types.FindingSeverityWarning {
+	if sev != types.FindingSeverityError && sev != types.FindingSeverityWarning && !(item.Source == types.FindingSourceUser && selected) {
 		return types.ChangeKindOther
 	}
 	if step != types.StepReview && step != types.StepTest {
@@ -143,15 +154,36 @@ func findingKind(step types.StepName, item types.Finding, selected, repairPublis
 	return types.ChangeKindOther
 }
 
-func parseFindingItems(raw *string) []types.Finding {
+func parseFindings(raw *string) types.Findings {
 	if raw == nil || strings.TrimSpace(*raw) == "" {
-		return nil
+		return types.Findings{}
 	}
 	findings, err := types.ParseFindingsJSON(*raw)
 	if err != nil {
-		return nil
+		return types.Findings{}
 	}
-	return findings.Items
+	return findings
+}
+
+// withUserFindings appends the findings a human authored at the fix gate
+// (StepRound.UserFindingsJSON) to the round's own; the agent findings that
+// list repeats are already present under the same IDs.
+func withUserFindings(items, user []types.Finding) []types.Finding {
+	if len(user) == 0 {
+		return items
+	}
+	seen := make(map[string]bool, len(items))
+	for _, item := range items {
+		seen[item.ID] = true
+	}
+	for _, item := range user {
+		if item.ID == "" || seen[item.ID] {
+			continue
+		}
+		seen[item.ID] = true
+		items = append(items, item)
+	}
+	return items
 }
 
 func selectedIDs(round *db.StepRound) map[string]bool {
@@ -171,12 +203,27 @@ func selectedIDs(round *db.StepRound) map[string]bool {
 	return out
 }
 
+// fingerprint is a finding's identity across rounds. A CI check is identified
+// by the check itself: its description embeds the provider's per-execution
+// details link, which changes on every rerun of the same red check.
 func fingerprint(item types.Finding) string {
-	norm := strings.ToLower(strings.Join([]string{
+	parts := []string{
 		strings.TrimSpace(item.File),
 		strconv.Itoa(item.Line),
 		strings.Join(strings.Fields(strings.TrimSpace(item.Description)), " "),
-	}, "|"))
+	}
+	if item.Category == types.FindingCategoryCICheck {
+		parts = []string{item.Category, strings.TrimSpace(item.CheckID), strings.TrimSpace(item.Check)}
+	}
+	norm := strings.ToLower(strings.Join(parts, "|"))
 	sum := sha256.Sum256([]byte(norm))
 	return hex.EncodeToString(sum[:])[:16]
+}
+
+func location(item types.Finding) string {
+	file := strings.TrimSpace(item.File)
+	if file == "" || item.Line <= 0 {
+		return ""
+	}
+	return strings.ToLower(file) + "|" + strconv.Itoa(item.Line)
 }

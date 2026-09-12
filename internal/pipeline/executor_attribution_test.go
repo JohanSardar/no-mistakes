@@ -14,8 +14,9 @@ import (
 )
 
 // The run's terminal transition (completeRun/failRun) reconciles the pre-Lint
-// attribution snapshot into runs.attribution_json and replaces the attribution
-// step's findings with the final record, for a completed and a failed run.
+// attribution snapshot into runs.attribution_json, the record's only store,
+// and refreshes the attribution step's summary line, for a completed and a
+// failed run.
 func TestExecutor_TerminalRunReconcilesAttribution(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -139,11 +140,11 @@ func TestExecutor_TerminalRunReconcilesAttribution(t *testing.T) {
 			if err != nil {
 				t.Fatalf("attribution step findings: %v (%q)", err, attrFindings)
 			}
-			if parsed.Attribution == nil || parsed.Attribution.Phase != types.AttributionPhaseFinal {
-				t.Fatalf("attribution step findings were not replaced by the final record: %+v", parsed.Attribution)
-			}
 			if !strings.Contains(parsed.Summary, "attribution final") {
-				t.Fatalf("summary = %q", parsed.Summary)
+				t.Fatalf("summary was not refreshed for the final phase: %q", parsed.Summary)
+			}
+			if strings.Contains(attrFindings, `"bugs"`) {
+				t.Fatalf("step findings duplicated the attribution record: %s", attrFindings)
 			}
 		})
 	}

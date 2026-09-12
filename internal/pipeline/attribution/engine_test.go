@@ -39,6 +39,39 @@ func TestAddedLinesIgnoresContextAndDeletions(t *testing.T) {
 	}
 }
 
+// Inside a hunk every "+" line is content: a prefix-increment statement
+// ("+++count;") or an added line beginning with "++ " is an addition, not a
+// file header that resets the path or the line counter.
+func TestAddedLinesCountsPlusPrefixedContentInsideAHunk(t *testing.T) {
+	diff := `diff --git a/svc.c b/svc.c
+--- a/svc.c
++++ b/svc.c
+@@ -4,1 +4,5 @@
+ int count = 0;
++++count;
++buf[count] = x;
++++ x
++done();
+diff --git a/other.c b/other.c
+--- a/other.c
++++ b/other.c
+@@ -0,0 +1 @@
++int other;
+`
+	got := addedLines(diff)
+	for _, want := range []int{5, 6, 7, 8} {
+		if _, ok := got["svc.c"][want]; !ok {
+			t.Fatalf("svc.c line %d missing from %v", want, got["svc.c"])
+		}
+	}
+	if _, ok := got["other.c"][1]; !ok {
+		t.Fatalf("other.c line 1 missing from %v", got)
+	}
+	if len(got) != 2 {
+		t.Fatalf("a content line was read as a file header: %v", got)
+	}
+}
+
 func TestSnapshot_OriginalWorkerFix(t *testing.T) {
 	dir, _, submitted, pipelineHead := repoWithWorkerBugAndPipelineFix(t)
 	in := fixtureInput(t, dir, submitted, pipelineHead)
@@ -161,11 +194,150 @@ func TestSnapshot_InPlaceFixLocatesEachFindingAtItsOwnRound(t *testing.T) {
 		t.Fatalf("counts = %+v bugs=%+v gaps=%v", rec.Counts, rec.Bugs, rec.EvidenceGaps)
 	}
 	byDesc := bugsByDescription(rec)
-	if got := byDesc["nil deref"]; got.Attribution != types.AttributionOriginalWorker || got.Outcome != types.BugOutcomeFixedBeforeShipping {
+	// The final round still reports handler.go:2, so the worker bug is not
+	// credited as fixed: the re-report may be the same defect reworded.
+	if got := byDesc["nil deref"]; got.Attribution != types.AttributionOriginalWorker || got.Outcome != types.BugOutcomeUnknown {
 		t.Fatalf("worker bug = %+v", got)
 	}
 	if got := byDesc["fixed() ignores its error"]; got.Attribution != types.AttributionPipeline || got.Outcome != types.BugOutcomeStillOpen {
 		t.Fatalf("pipeline bug = %+v", got)
+	}
+	if rec.Counts.FixedBeforeShipping != 0 {
+		t.Fatalf("credited a fix the final round contradicts: %+v", rec.Counts)
+	}
+}
+
+// The Test step records no ReviewedHeadSHA on its rounds; the head each
+// round validated is the tested_head_sha inside its findings, and a finding
+// is located there, not at the post-fix head.
+func TestSnapshot_TestStepInPlaceFixLocatesEachFindingAtItsTestedHead(t *testing.T) {
+	dir, _, submitted, _ := repoWithWorkerBugAndPipelineFix(t)
+	gitCmd(t, dir, "reset", "--hard", submitted)
+	head := commitFile(t, dir, "handler.go", "package handler\nfunc worker() { fixed() }\n", "pipeline in-place fix")
+	in := fixtureInput(t, dir, submitted, head)
+	test := insertStep(t, in, types.StepTest, types.StepStatusCompleted)
+	original := testedFindingsJSON(submitted, types.Finding{ID: "test-1", Severity: types.FindingSeverityError, File: "handler.go", Line: 2, Description: "worker() panics on nil input", Action: types.ActionAutoFix})
+	introduced := testedFindingsJSON(head, types.Finding{ID: "test-1", Severity: types.FindingSeverityError, File: "handler.go", Line: 2, Description: "fixed() ignores its error", Action: types.ActionAutoFix})
+	insertRound(t, in, test, 1, "initial", original, "", true, false)
+	insertRound(t, in, test, 2, "auto_fix", introduced, "", false, true)
+
+	rec, err := Snapshot(context.Background(), in.Input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Counts.OriginalWorker != 1 || rec.Counts.Pipeline != 1 || rec.Counts.Unknown != 0 {
+		t.Fatalf("counts = %+v bugs=%+v gaps=%v", rec.Counts, rec.Bugs, rec.EvidenceGaps)
+	}
+	byDesc := bugsByDescription(rec)
+	if got := byDesc["worker() panics on nil input"]; got.Attribution != types.AttributionOriginalWorker || got.Confidence != types.AttributionConfidenceHigh {
+		t.Fatalf("worker bug = %+v", got)
+	}
+	if got := byDesc["fixed() ignores its error"]; got.Attribution != types.AttributionPipeline {
+		t.Fatalf("pipeline bug = %+v", got)
+	}
+}
+
+// A defect the re-review still reports at the same file:line under different
+// wording is not evidence the fix landed: the first report stays unknown, the
+// second stays open, and nothing is credited as fixed before shipping.
+func TestSnapshot_RewordedFindingAtTheSameLocationIsNotCreditedAsFixed(t *testing.T) {
+	dir, _, submitted, head := repoWithWorkerBugAndPipelineFix(t)
+	in := fixtureInput(t, dir, submitted, head)
+	review := insertStep(t, in, types.StepReview, types.StepStatusCompleted)
+	first := findingsJSON(types.Finding{ID: "review-1", Severity: types.FindingSeverityError, File: "handler.go", Line: 2, Description: "nil deref of svc", Action: types.ActionAutoFix})
+	reworded := findingsJSON(types.Finding{ID: "review-1", Severity: types.FindingSeverityError, File: "handler.go", Line: 2, Description: "svc may be nil here", Action: types.ActionAutoFix})
+	insertRound(t, in, review, 1, "initial", first, submitted, true, false)
+	insertRound(t, in, review, 2, "auto_fix", reworded, head, false, true)
+
+	snap, err := Snapshot(context.Background(), in.Input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Counts.FixedBeforeShipping != 0 {
+		t.Fatalf("credited a fix the re-review contradicts: %+v", snap.Bugs)
+	}
+	byDesc := bugsByDescription(snap)
+	if got := byDesc["nil deref of svc"]; got.Outcome != types.BugOutcomeUnknown {
+		t.Fatalf("first report = %+v", got)
+	}
+	if got := byDesc["svc may be nil here"]; got.Outcome != types.BugOutcomeStillOpen {
+		t.Fatalf("re-report = %+v", got)
+	}
+
+	in.Run.Status = types.RunCompleted
+	final, err := Reconcile(context.Background(), in.Input, snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.Counts.FixedBeforeShipping != 0 || final.Counts.Escaped != 1 {
+		t.Fatalf("final counts = %+v bugs=%+v", final.Counts, final.Bugs)
+	}
+}
+
+// A human-authored finding selected at the fix gate is a confirmed bug: it is
+// read from the round's user findings and attributed like any other.
+func TestSnapshot_UserAuthoredFindingSelectedForFixIsABug(t *testing.T) {
+	dir, _, submitted, head := repoWithWorkerBugAndPipelineFix(t)
+	in := fixtureInput(t, dir, submitted, head)
+	review := insertStep(t, in, types.StepReview, types.StepStatusCompleted)
+	clean := findingsJSON()
+	round := insertRound(t, in, review, 1, "initial", clean, submitted, false, false)
+	merged := types.MergeUserOverrides(types.Findings{Summary: "0 selected findings"}, nil, []types.Finding{{
+		File: "handler.go", Line: 2, Description: "worker() drops the request context",
+	}})
+	mergedJSON, err := types.MarshalFindingsJSON(merged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := `["` + merged.Items[0].ID + `"]`
+	if err := in.DB.SetStepRoundUserDecision(round.ID, &ids, db.RoundSelectionSourceUser, &mergedJSON); err != nil {
+		t.Fatal(err)
+	}
+	round.SelectedFindingIDs, round.UserFindingsJSON = &ids, &mergedJSON
+	insertRound(t, in, review, 2, "user_fix", clean, head, false, true)
+
+	rec, err := Snapshot(context.Background(), in.Input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.Bugs) != 1 || rec.Counts.OriginalWorker != 1 || rec.Counts.FixedBeforeShipping != 1 {
+		t.Fatalf("user finding not attributed: bugs=%+v counts=%+v non_bugs=%+v", rec.Bugs, rec.Counts, rec.NonBugs)
+	}
+	if rec.Bugs[0].ID != merged.Items[0].ID || rec.Bugs[0].Outcome != types.BugOutcomeFixedBeforeShipping {
+		t.Fatalf("bug = %+v", rec.Bugs[0])
+	}
+}
+
+// Gate agents address files by absolute worktree path; the path is matched
+// relative to the worktree, and one outside it is unknown, never pre-existing.
+func TestSnapshot_AbsoluteFindingPathIsMatchedRelativeToTheWorktree(t *testing.T) {
+	dir, _, submitted, head := repoWithWorkerBugAndPipelineFix(t)
+	in := fixtureInput(t, dir, submitted, head)
+	seedReviewFinding(t, in, filepath.Join(dir, "handler.go"), 2, "nil deref", types.ActionAutoFix, true, submitted)
+
+	rec, err := Snapshot(context.Background(), in.Input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Counts.OriginalWorker != 1 || rec.Bugs[0].Attribution != types.AttributionOriginalWorker {
+		t.Fatalf("absolute path lost its diff match: %+v", rec.Bugs)
+	}
+}
+
+func TestSnapshot_FindingPathOutsideTheWorktreeIsUnknown(t *testing.T) {
+	dir, _, submitted, head := repoWithWorkerBugAndPipelineFix(t)
+	in := fixtureInput(t, dir, submitted, head)
+	seedReviewFinding(t, in, filepath.Join(t.TempDir(), "handler.go"), 2, "nil deref", types.ActionAutoFix, true, submitted)
+
+	rec, err := Snapshot(context.Background(), in.Input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Counts.Unknown != 1 || rec.Counts.PreExisting != 0 || rec.Bugs[0].Attribution != types.AttributionUnknown {
+		t.Fatalf("foreign path attributed: %+v", rec.Bugs)
+	}
+	if len(rec.Bugs[0].Evidence) == 0 || !strings.Contains(rec.Bugs[0].Evidence[0], "outside the worktree") {
+		t.Fatalf("evidence = %v", rec.Bugs[0].Evidence)
 	}
 }
 
@@ -538,7 +710,10 @@ func TestReconcile_NilSnapshotIsUnavailable(t *testing.T) {
 // A red CI check is a bug only when the fix round published a code change;
 // a red job the fixer declined to touch is not a confirmed bug.
 func TestSnapshot_CICheckIsABugOnlyWithAPublishedRepair(t *testing.T) {
-	ciFinding := findingsJSON(types.Finding{ID: "ci-1", Severity: types.FindingSeverityError, Action: types.ActionAutoFix, Category: types.FindingCategoryCICheck, Check: "test", Description: "check test failed"})
+	ciFinding := findingsJSON(types.Finding{ID: "ci-1", Severity: types.FindingSeverityError, Action: types.ActionAutoFix, Category: types.FindingCategoryCICheck, Check: "test", CheckID: "check-7", Description: "CI check failing: test - https://ci.example/runs/1/job/1"})
+	// The same red check re-observed after the repair carries a fresh
+	// per-execution details link; it is the same check, still red.
+	relinked := findingsJSON(types.Finding{ID: "ci-1", Severity: types.FindingSeverityError, Action: types.ActionAutoFix, Category: types.FindingCategoryCICheck, Check: "test", CheckID: "check-7", Description: "CI check failing: test - https://ci.example/runs/2/job/9"})
 	for _, tc := range []struct {
 		name          string
 		repair        bool
@@ -548,6 +723,7 @@ func TestSnapshot_CICheckIsABugOnlyWithAPublishedRepair(t *testing.T) {
 	}{
 		{"repair_published_and_green", true, "", 1, types.BugOutcomeFixedBeforeShipping},
 		{"repair_published_still_red", true, ciFinding, 1, types.BugOutcomeStillOpen},
+		{"repair_published_still_red_with_a_new_details_link", true, relinked, 1, types.BugOutcomeStillOpen},
 		{"no_code_change_needed", false, ciFinding, 0, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -572,6 +748,13 @@ func TestSnapshot_CICheckIsABugOnlyWithAPublishedRepair(t *testing.T) {
 			}
 			if rec.Bugs[0].Attribution != types.AttributionUnknown || rec.Bugs[0].Outcome != tc.wantOutcome {
 				t.Fatalf("bug = %+v", rec.Bugs[0])
+			}
+			wantFixed := 0
+			if tc.wantOutcome == types.BugOutcomeFixedBeforeShipping {
+				wantFixed = 1
+			}
+			if rec.Counts.NonBugs != 0 || rec.Counts.FixedBeforeShipping != wantFixed {
+				t.Fatalf("counts = %+v non_bugs=%+v", rec.Counts, rec.NonBugs)
 			}
 		})
 	}
@@ -603,7 +786,7 @@ func TestBugFixLink_ConfirmedOnlyWhenTheRepairShipped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if failed.BugFix == nil || failed.BugFix.Confirmed || failed.BugFix.Confidence != types.AttributionConfidenceUnknown {
+	if failed.BugFix == nil || failed.BugFix.Confirmed {
 		t.Fatalf("failed run confirmed a repair that never shipped: %+v", failed.BugFix)
 	}
 	if !containsGap(failed, "did not ship") {
@@ -615,7 +798,7 @@ func TestBugFixLink_ConfirmedOnlyWhenTheRepairShipped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if final.BugFix == nil || !final.BugFix.Confirmed || final.BugFix.Confidence != types.AttributionConfidenceHigh {
+	if final.BugFix == nil || !final.BugFix.Confirmed {
 		t.Fatalf("expected confirmed link: %+v", final.BugFix)
 	}
 }
@@ -874,7 +1057,13 @@ func insertRepairRound(t *testing.T, in *testEnv, step *db.StepResult, n int, fi
 }
 
 func findingsJSON(items ...types.Finding) string {
-	raw, err := types.MarshalFindingsJSON(types.Findings{Items: items, Summary: "test", RiskLevel: "low"})
+	return testedFindingsJSON("", items...)
+}
+
+// testedFindingsJSON is the Test step's shape: the head the round validated
+// travels inside the findings as tested_head_sha.
+func testedFindingsJSON(testedHead string, items ...types.Finding) string {
+	raw, err := types.MarshalFindingsJSON(types.Findings{Items: items, Summary: "test", RiskLevel: "low", TestedHeadSHA: testedHead})
 	if err != nil {
 		panic(err)
 	}

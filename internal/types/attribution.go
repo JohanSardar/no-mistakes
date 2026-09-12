@@ -23,7 +23,6 @@ const (
 	AttributionStatusPartial     = "partial"
 	AttributionStatusSkipped     = "skipped"
 	AttributionStatusUnavailable = "unavailable"
-	AttributionStatusNotRecorded = "not_recorded"
 )
 
 const (
@@ -41,17 +40,15 @@ const (
 )
 
 const (
-	ChangeKindBug      = "bug"
-	ChangeKindDocs     = "docs"
-	ChangeKindStyle    = "style"
-	ChangeKindRefactor = "refactor"
-	ChangeKindOther    = "other"
+	ChangeKindBug   = "bug"
+	ChangeKindDocs  = "docs"
+	ChangeKindStyle = "style"
+	ChangeKindOther = "other"
 )
 
 const (
 	AttributionConfidenceHigh    = "high"
 	AttributionConfidenceMedium  = "medium"
-	AttributionConfidenceLow     = "low"
 	AttributionConfidenceUnknown = "unknown"
 )
 
@@ -116,12 +113,12 @@ type WorkerIdentity struct {
 }
 
 // BugFixLink is present only when the run was started with the typed
-// --fixes-run / fixes_run_id signal. The originating run's own record is not
-// rewritten.
+// --fixes-run / fixes_run_id signal. Confirmed is the single verdict: the
+// repair shipped (review and test completed, run completed) or it did not.
+// The originating run's own record is not rewritten.
 type BugFixLink struct {
 	OriginatingRunID string   `json:"originating_run_id"`
 	Confirmed        bool     `json:"confirmed"`
-	Confidence       string   `json:"confidence"`
 	Evidence         []string `json:"evidence,omitempty"`
 }
 
@@ -137,11 +134,10 @@ type AttributedBug struct {
 	Outcome     string   `json:"outcome"`
 	Confidence  string   `json:"confidence"`
 	Evidence    []string `json:"evidence,omitempty"`
-	FixedInStep StepName `json:"fixed_in_step,omitempty"`
 }
 
-// NonBugChange records docs/style/refactor/other findings so they are
-// explicitly not counted as bugs.
+// NonBugChange records docs/style/other findings so they are explicitly not
+// counted as bugs.
 type NonBugChange struct {
 	ID          string   `json:"id"`
 	Fingerprint string   `json:"fingerprint"`

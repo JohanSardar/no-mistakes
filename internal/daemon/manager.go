@@ -1859,18 +1859,16 @@ func launchAttributionFrom(worker json.RawMessage, fixesRunID string) (types.Lau
 	return attr, nil
 }
 
+// inheritLaunchAttribution carries only the typed bug-fix link into a rerun.
+// Worker identity is deliberately not inherited: a rerun's submitted head is
+// the gate head, which already contains the earlier run's pipeline commits, so
+// re-asserting the worker would name it for lines the pipeline wrote.
 func inheritLaunchAttribution(attr types.LaunchAttribution, selected *db.Run) types.LaunchAttribution {
 	if selected == nil {
 		return attr
 	}
 	if strings.TrimSpace(attr.FixesRunID) == "" && selected.FixesRunID != nil {
 		attr.FixesRunID = strings.TrimSpace(*selected.FixesRunID)
-	}
-	if attr.Worker == nil && selected.WorkerProvenanceJSON != nil {
-		parsed, err := types.ParseWorkerProvenance(*selected.WorkerProvenanceJSON)
-		if err == nil {
-			attr.Worker = parsed
-		}
 	}
 	attr.Normalize()
 	return attr

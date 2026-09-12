@@ -27,33 +27,32 @@ func diffAdded(ctx context.Context, dir, from, to string) (map[string]map[int]st
 
 // addedLines maps slash-normalized paths to new-file line numbers that a
 // unified diff introduced. Context and deletion lines are not additions: a
-// touched file is not evidence that every line in it is new.
+// touched file is not evidence that every line in it is new. File headers
+// are read only between a "diff --git" line and its first hunk; inside a
+// hunk every "+" line is content, so "+++count;" is an addition, not a header.
 func addedLines(diff string) map[string]map[int]struct{} {
 	out := make(map[string]map[int]struct{})
 	var path string
 	newLine := 0
+	inHunk := false
 	for _, raw := range strings.Split(diff, "\n") {
 		line := strings.TrimRight(raw, "\r")
 		switch {
-		case strings.HasPrefix(line, "+++ "):
+		case strings.HasPrefix(line, "diff --git "):
+			path, newLine, inHunk = "", 0, false
+		case !inHunk && strings.HasPrefix(line, "+++ "):
 			path = normalizeDiffPath(strings.TrimPrefix(line, "+++ "))
-			newLine = 0
 		case strings.HasPrefix(line, "@@ "):
 			newLine = parseHunkNewStart(line)
-		case path == "" || path == "/dev/null":
+			inHunk = true
+		case !inHunk || path == "" || path == "/dev/null":
 			continue
 		case strings.HasPrefix(line, "+"):
-			if strings.HasPrefix(line, "+++") {
-				continue
-			}
 			if newLine > 0 {
 				setAdded(out, path, newLine)
 			}
 			newLine++
 		case strings.HasPrefix(line, "-"):
-			if strings.HasPrefix(line, "---") {
-				continue
-			}
 			// deletion: old file only
 		case strings.HasPrefix(line, "\\"):
 			// "\ No newline at end of file"
