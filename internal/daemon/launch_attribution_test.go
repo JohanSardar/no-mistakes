@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -75,8 +77,11 @@ func TestPushReceivedRefusesBadFixesRunBeforeSupersedingOrCreatingARun(t *testin
 
 // Entry provenance supplied on a push is recorded on the run. A rerun that
 // supplies none inherits only the typed bug-fix link: its submitted head is
-// the gate head with the earlier run's pipeline commits in it, so the worker
-// identity stays unknown unless the caller supplies it again.
+// the gate head, which may hold the earlier run's pipeline commits, so the
+// worker identity stays unknown unless the caller supplies it again. The
+// rerun marker follows the head, not the trigger: re-submitting the exact
+// head the worker pushed is not marked, a gate head no worker launch
+// submitted is.
 func TestLaunchAttributionIsRecordedAndInheritedByRerun(t *testing.T) {
 	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step { return []pipeline.Step{&mockPassStep{name: types.StepReview}} })
 	repo, head := setupTestGitRepo(t, p, d, "launch-attribution-repo")
@@ -128,8 +133,8 @@ func TestLaunchAttributionIsRecordedAndInheritedByRerun(t *testing.T) {
 	if inherited.WorkerProvenanceJSON != nil {
 		t.Fatalf("rerun re-asserted the earlier worker identity over the gate head: %v", *inherited.WorkerProvenanceJSON)
 	}
-	if fixRun.Rerun || !inherited.Rerun {
-		t.Fatalf("rerun marker: pushed run %v, rerun %v", fixRun.Rerun, inherited.Rerun)
+	if fixRun.Rerun || inherited.Rerun {
+		t.Fatalf("rerun marker on the exact head the worker pushed: pushed run %v, rerun %v", fixRun.Rerun, inherited.Rerun)
 	}
 
 	// An explicit value on the rerun is recorded as supplied.
@@ -146,8 +151,31 @@ func TestLaunchAttributionIsRecordedAndInheritedByRerun(t *testing.T) {
 	if overridden.FixesRunID == nil || *overridden.FixesRunID != original.ID {
 		t.Fatalf("explicit worker override dropped the inherited fixes_run_id: %v", overridden.FixesRunID)
 	}
-	if !overridden.Rerun {
-		t.Fatal("an explicit worker override cleared the rerun marker")
+	if overridden.Rerun {
+		t.Fatal("an explicit worker override marked a retry of the worker's own head")
+	}
+
+	// The gate branch moves past the worker's submission (a pipeline commit);
+	// a rerun now submits a head no worker launch pushed.
+	if err := os.WriteFile(filepath.Join(repo.WorkingPath, "test.txt"), []byte("pipeline fix"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, repo.WorkingPath, "commit", "-am", "pipeline fix")
+	gitCmd(t, repo.WorkingPath, "push", "gate", "HEAD:refs/heads/main")
+	moved := gitOutput(t, repo.WorkingPath, "rev-parse", "HEAD")
+	var gateRerun ipc.RerunResult
+	if err := client.Call(ipc.MethodRerun, &ipc.RerunParams{RepoID: repo.ID, Branch: "main"}, &gateRerun); err != nil {
+		t.Fatal(err)
+	}
+	marked := waitForRunTerminalState(t, d, gateRerun.RunID)
+	if marked.SubmittedHeadSHA == nil || *marked.SubmittedHeadSHA != moved {
+		t.Fatalf("rerun submitted %v, want the gate head %s", marked.SubmittedHeadSHA, moved)
+	}
+	if !marked.Rerun {
+		t.Fatal("rerun of a gate head no worker launch submitted was not marked")
+	}
+	if marked.FixesRunID == nil || *marked.FixesRunID != original.ID {
+		t.Fatalf("marked rerun lost fixes_run_id: %v", marked.FixesRunID)
 	}
 }
 

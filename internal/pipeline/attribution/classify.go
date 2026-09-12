@@ -66,15 +66,24 @@ func classifyStepFindings(step *db.StepResult, rounds []*db.StepRound, dir strin
 	}
 	final := make(map[string]bool)
 	finalLocations := make(map[string]bool)
+	finalSubjects := make(map[string]bool)
 	for _, item := range parsed[len(parsed)-1].items {
 		final[fingerprint(item)] = true
 		if loc := location(item); loc != "" {
 			finalLocations[loc] = true
 		}
+		if s := subject(item); s != "" {
+			finalSubjects[s] = true
+		}
 	}
 
 	var out []classifiedFinding
 	index := make(map[string]int)
+	// subjects maps a finding's file and wording to its entry so a later
+	// round's same-worded report at another line (the fix round inserted or
+	// removed lines above it) folds into the finding it moved, never a second
+	// bug; within one round two such reports are two findings.
+	subjects := make(map[string]int)
 	for i, rf := range parsed {
 		fixFollows, repairFollows := false, false
 		for _, later := range parsed[i+1:] {
@@ -87,10 +96,18 @@ func classifyStepFindings(step *db.StepResult, rounds []*db.StepRound, dir strin
 			fp := fingerprint(item)
 			selected := rf.selected[item.ID]
 			kind := findingKind(step.StepName, item, selected, repairFollows)
-			// A reworded re-report at the same file:line is not proof the
-			// fix landed; the outcome stays unknown rather than crediting it.
-			fixed := selected && fixFollows && !final[fp] && !finalLocations[location(item)]
-			if j, ok := index[fp]; ok {
+			// The final round still reporting the same wording in the file,
+			// at any line, means the finding is still open; a reworded
+			// re-report at the same file:line is not proof the fix landed
+			// either, and that outcome stays unknown rather than credited.
+			reported := final[fp] || finalSubjects[subject(item)]
+			fixed := selected && fixFollows && !reported && !finalLocations[location(item)]
+			j, ok := index[fp]
+			if !ok {
+				j, ok = subjects[subject(item)]
+			}
+			if ok {
+				index[fp] = j
 				if kind == types.ChangeKindBug {
 					out[j].Kind = kind
 				}
@@ -101,7 +118,7 @@ func classifyStepFindings(step *db.StepResult, rounds []*db.StepRound, dir strin
 			}
 			cf := classifiedFinding{Finding: item, SourceStep: step.StepName, Kind: kind, LocateSHA: rf.locate}
 			switch {
-			case final[fp]:
+			case reported:
 				cf.Outcome = types.BugOutcomeStillOpen
 			case fixed:
 				cf.Outcome = types.BugOutcomeFixedBeforeShipping
@@ -110,6 +127,13 @@ func classifyStepFindings(step *db.StepResult, rounds []*db.StepRound, dir strin
 			}
 			index[fp] = len(out)
 			out = append(out, cf)
+		}
+		for _, item := range rf.items {
+			if s := subject(item); s != "" {
+				if _, seen := subjects[s]; !seen {
+					subjects[s] = index[fingerprint(item)]
+				}
+			}
 		}
 	}
 	return out
@@ -240,7 +264,7 @@ func fingerprint(item types.Finding) string {
 	parts := []string{
 		strings.TrimSpace(item.File),
 		strconv.Itoa(item.Line),
-		strings.Join(strings.Fields(strings.TrimSpace(item.Description)), " "),
+		wording(item),
 	}
 	if item.Category == types.FindingCategoryCICheck {
 		parts = []string{item.Category, strings.TrimSpace(item.Check)}
@@ -248,6 +272,24 @@ func fingerprint(item types.Finding) string {
 	norm := strings.ToLower(strings.Join(parts, "|"))
 	sum := sha256.Sum256([]byte(norm))
 	return hex.EncodeToString(sum[:])[:16]
+}
+
+func wording(item types.Finding) string {
+	return strings.Join(strings.Fields(item.Description), " ")
+}
+
+// subject is a finding's file and wording without the line. A CI check has
+// no file and is identified by its check name instead.
+func subject(item types.Finding) string {
+	file := strings.TrimSpace(item.File)
+	if file == "" || item.Category == types.FindingCategoryCICheck {
+		return ""
+	}
+	desc := wording(item)
+	if desc == "" {
+		return ""
+	}
+	return strings.ToLower(file + "|" + desc)
 }
 
 func location(item types.Finding) string {

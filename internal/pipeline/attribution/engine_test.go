@@ -274,6 +274,53 @@ func TestSnapshot_RewordedFindingAtTheSameLocationIsNotCreditedAsFixed(t *testin
 	}
 }
 
+// A fix round that repairs one finding and inserts lines above another moves
+// the second one; the re-review reports it with the same wording at a new
+// line. That is neither a fix nor a second bug.
+func TestSnapshot_MovedFindingWithTheSameWordingIsNeitherFixedNorASecondBug(t *testing.T) {
+	dir, _, submitted, _ := repoWithWorkerBugAndPipelineFix(t)
+	gitCmd(t, dir, "reset", "--hard", submitted)
+	head := commitFile(t, dir, "handler.go", "package handler\nfunc guard() {}\nfunc worker() {}\n", "pipeline inserts a line above")
+	in := fixtureInput(t, dir, submitted, head)
+	review := insertStep(t, in, types.StepReview, types.StepStatusCompleted)
+	first := findingsJSON(
+		types.Finding{ID: "review-1", Severity: types.FindingSeverityError, File: "handler.go", Line: 1, Description: "package comment missing", Action: types.ActionAutoFix},
+		types.Finding{ID: "review-2", Severity: types.FindingSeverityError, File: "handler.go", Line: 2, Description: "worker ignores its error", Action: types.ActionAutoFix},
+	)
+	moved := findingsJSON(types.Finding{ID: "review-1", Severity: types.FindingSeverityError, File: "handler.go", Line: 3, Description: "worker ignores its error", Action: types.ActionAutoFix})
+	round := insertRound(t, in, review, 1, "initial", first, submitted, false, false)
+	ids := `["review-1","review-2"]`
+	if err := in.DB.SetStepRoundSelection(round.ID, &ids, db.RoundSelectionSourceAutoFix); err != nil {
+		t.Fatal(err)
+	}
+	round.SelectedFindingIDs = &ids
+	insertRound(t, in, review, 2, "auto_fix", moved, head, false, true)
+
+	snap, err := Snapshot(context.Background(), in.Input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Bugs) != 2 || snap.Counts.FixedBeforeShipping != 1 {
+		t.Fatalf("moved finding was credited or double counted: counts=%+v bugs=%+v", snap.Counts, snap.Bugs)
+	}
+	byDesc := bugsByDescription(snap)
+	if got := byDesc["package comment missing"]; got.Outcome != types.BugOutcomeFixedBeforeShipping {
+		t.Fatalf("repaired finding = %+v", got)
+	}
+	if got := byDesc["worker ignores its error"]; got.Outcome != types.BugOutcomeStillOpen || got.Line != 2 || got.Attribution != types.AttributionOriginalWorker {
+		t.Fatalf("moved finding = %+v", got)
+	}
+
+	in.Run.Status = types.RunCompleted
+	final, err := Reconcile(context.Background(), in.Input, snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(final.Bugs) != 2 || final.Counts.FixedBeforeShipping != 1 || final.Counts.Escaped != 1 {
+		t.Fatalf("final counts = %+v bugs=%+v", final.Counts, final.Bugs)
+	}
+}
+
 // A human-authored finding selected at the fix gate is a confirmed bug: it is
 // read from the round's user findings and attributed like any other.
 func TestSnapshot_UserAuthoredFindingSelectedForFixIsABug(t *testing.T) {

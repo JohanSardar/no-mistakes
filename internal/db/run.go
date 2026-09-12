@@ -90,10 +90,11 @@ type Run struct {
 	// earlier run in the same repository. Nil/empty means this is not a
 	// bug-fix run; free-text intent never sets it.
 	FixesRunID *string
-	// Rerun is true when the run was launched by rerun rather than by a push
-	// of the worker's own head: SubmittedHeadSHA is then the gate branch head,
-	// which may already carry an earlier run's pipeline commits, so attribution
-	// cannot split the lines it carried between the worker and that pipeline.
+	// Rerun is true when a rerun submitted a gate head that no worker launch
+	// on the branch had submitted: it may already carry an earlier run's
+	// pipeline commits, so attribution cannot split the lines it carried
+	// between the worker and that pipeline. A rerun of the exact head the
+	// worker pushed is the worker's submission again and is not marked.
 	Rerun bool
 	// AttributionSnapshotJSON is the pre-Lint observational record. Nil on
 	// legacy runs and when the attribution step did not run.
