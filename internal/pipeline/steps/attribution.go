@@ -66,6 +66,11 @@ func attributionInput(sctx *pipeline.StepContext) (attribution.Input, error) {
 		}
 		in.Rounds[step.ID] = rounds
 	}
+	priorRuns, err := sctx.DB.GetRunsByRepo(sctx.Run.RepoID)
+	if err != nil {
+		return in, fmt.Errorf("load earlier runs for attribution: %w", err)
+	}
+	in.PriorRuns = priorRuns
 	if sctx.WorkDir != "" {
 		if live, err := git.HeadSHA(sctx.Ctx, sctx.WorkDir); err == nil && live != "" {
 			in.HeadSHA = live

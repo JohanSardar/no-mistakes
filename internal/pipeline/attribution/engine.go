@@ -27,8 +27,13 @@ type Input struct {
 	Repo    *db.Repo
 	Steps   []*db.StepResult
 	Rounds  map[string][]*db.StepRound
-	HeadSHA string
-	PRURL   string
+	// PriorRuns are the repository's other recorded runs. Those on the same
+	// branch whose recorded head is in the submitted history contributed
+	// pipeline commits the worker synced before submitting; the lines those
+	// commits added are read from the run rows, never reconstructed.
+	PriorRuns []*db.Run
+	HeadSHA   string
+	PRURL     string
 }
 
 // Snapshot builds the pre-Lint observational record: changes since submission
@@ -213,11 +218,16 @@ type locator struct {
 	// the submission; a later rewrite (a CI merge-conflict repair restarting
 	// review) has no such stand-in and locations after it are unknown.
 	firstReviewHead string
-	anchors         map[string]*anchor
-	diffs           map[string]map[string]map[int]struct{}
-	blobs           map[string]int
-	unavailable     string
-	gaps            []string
+	// priorRuns are earlier runs on the same branch. Each one whose recorded
+	// head is an ancestor of a located commit carried its own pipeline commits
+	// (submitted head..recorded head) into that history; a line those commits
+	// added is neither this run's worker's nor its pipeline's.
+	priorRuns   []*db.Run
+	anchors     map[string]*anchor
+	diffs       map[string]map[string]map[int]struct{}
+	blobs       map[string]int
+	unavailable string
+	gaps        []string
 }
 
 type anchor struct {
@@ -225,6 +235,17 @@ type anchor struct {
 	base       string
 	rewritten  bool
 	err        string
+	prior      []priorRange
+}
+
+// priorRange is an earlier run's pipeline span, from..to, both in the located
+// commit's history. from falls back to the branch base when that run's
+// submitted head is no longer available, which leaves everything the branch
+// had at its recorded head unknown rather than the worker's.
+type priorRange struct {
+	runID string
+	from  string
+	to    string
 }
 
 func newLocator(ctx context.Context, in Input) *locator {
@@ -234,6 +255,11 @@ func newLocator(ctx context.Context, in Input) *locator {
 	}
 	if in.Run != nil {
 		l.rerun = in.Run.Rerun
+		for _, prior := range in.PriorRuns {
+			if prior != nil && prior.ID != in.Run.ID && prior.Branch == in.Run.Branch {
+				l.priorRuns = append(l.priorRuns, prior)
+			}
+		}
 	}
 	if l.dir == "" {
 		l.unavailable = "worktree path is missing; git location is unknown"
@@ -323,6 +349,15 @@ func (l *locator) attribute(cf classifiedFinding) (bucket, confidence string, ev
 			l.gaps = appendUnique(l.gaps, gap)
 			return types.AttributionUnknown, types.AttributionConfidenceUnknown, []string{fmt.Sprintf("line %s:%d at %s was on the branch before the rerun; %s", file, line, short(locate), gap)}
 		}
+		prior, found, err := l.earlierPipelineRange(a, locate, file, line)
+		if err != nil {
+			return types.AttributionUnknown, types.AttributionConfidenceUnknown, []string{err.Error()}
+		}
+		if found {
+			gap := fmt.Sprintf("submitted head %s already carried run %s's pipeline commits (%s..%s); lines they added are not this run's worker's or pipeline's", short(l.submitted), prior.runID, short(prior.from), short(prior.to))
+			l.gaps = appendUnique(l.gaps, gap)
+			return types.AttributionUnknown, types.AttributionConfidenceUnknown, []string{fmt.Sprintf("line %s:%d at %s was added by run %s's pipeline (%s..%s) before this submission", file, line, short(locate), prior.runID, short(prior.from), short(prior.to))}
+		}
 		return types.AttributionOriginalWorker, confidence, []string{fmt.Sprintf("line %s:%d at %s was added by the submitted change (%s..%s)", file, line, short(locate), short(a.base), short(a.workerHead))}
 	}
 	lines, present := l.blobLines(locate, file)
@@ -378,8 +413,46 @@ func (l *locator) anchorFor(locate string) *anchor {
 	a.base = l.mergeBase(a.workerHead)
 	if a.base == "" {
 		l.gaps = appendUnique(l.gaps, fmt.Sprintf("branch base of %s could not be resolved against %q; worker vs pre-existing split is unknown", short(a.workerHead), l.defaultBranch))
+		return a
+	}
+	for _, prior := range l.priorRuns {
+		to := strings.TrimSpace(prior.HeadSHA)
+		if to == "" || !isAncestor(l.ctx, l.dir, to, locate) {
+			continue
+		}
+		from := strings.TrimSpace(deref(prior.SubmittedHeadSHA))
+		if from == to {
+			continue
+		}
+		if !commitExists(l.ctx, l.dir, from) {
+			from = a.base
+		}
+		a.prior = append(a.prior, priorRange{runID: prior.ID, from: from, to: to})
 	}
 	return a
+}
+
+// earlierPipelineRange reports the earlier run whose pipeline commits added
+// file:line, expressed at locate like the other partitions: added since that
+// run's submission and not added since its recorded head.
+func (l *locator) earlierPipelineRange(a *anchor, locate, file string, line int) (priorRange, bool, error) {
+	for _, pr := range a.prior {
+		since, err := l.added(pr.from, locate)
+		if err != nil {
+			return priorRange{}, false, fmt.Errorf("could not diff %s..%s", short(pr.from), short(locate))
+		}
+		if !lineAddedIn(since, file, line) {
+			continue
+		}
+		after, err := l.added(pr.to, locate)
+		if err != nil {
+			return priorRange{}, false, fmt.Errorf("could not diff %s..%s", short(pr.to), short(locate))
+		}
+		if !lineAddedIn(after, file, line) {
+			return pr, true, nil
+		}
+	}
+	return priorRange{}, false, nil
 }
 
 func (l *locator) mergeBase(sha string) string {
@@ -588,7 +661,11 @@ func ReconcileRun(ctx context.Context, database *db.DB, run *db.Run, repo *db.Re
 	if attrStep == nil {
 		return nil
 	}
-	in := Input{WorkDir: workDir, Run: run, Repo: repo, Steps: steps, Rounds: map[string][]*db.StepRound{}, HeadSHA: run.HeadSHA}
+	priorRuns, err := database.GetRunsByRepo(run.RepoID)
+	if err != nil {
+		return err
+	}
+	in := Input{WorkDir: workDir, Run: run, Repo: repo, Steps: steps, Rounds: map[string][]*db.StepRound{}, PriorRuns: priorRuns, HeadSHA: run.HeadSHA}
 	if run.PRURL != nil {
 		in.PRURL = *run.PRURL
 	}

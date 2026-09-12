@@ -193,4 +193,68 @@ func TestAttributionStep_MissingMetadataIsNotCleanScore(t *testing.T) {
 	}
 }
 
+// The step reads the branch's earlier runs from the database: a fresh push of
+// a synced branch submits a head carrying an earlier run's pipeline commit,
+// and a bug on that commit's line is unknown rather than the worker's.
+func TestAttributionStep_SyncedEarlierRunPipelineLineIsUnknown(t *testing.T) {
+	dir, baseSHA, firstSubmitted := setupGitRepo(t)
+	if err := os.WriteFile(filepath.Join(dir, "feature.txt"), []byte("feature code\nearlier pipeline fix\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, dir, "add", "-A")
+	gitCmd(t, dir, "commit", "-m", "earlier pipeline fix")
+	firstHead := gitCmd(t, dir, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(dir, "feature.txt"), []byte("feature code\nearlier pipeline fix\nlater worker code\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, dir, "add", "-A")
+	gitCmd(t, dir, "commit", "-m", "worker change after sync")
+	headSHA := gitCmd(t, dir, "rev-parse", "HEAD")
+
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "mock"}, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Run.SubmittedHeadSHA = &headSHA
+	earlier, err := sctx.DB.InsertRun(sctx.Repo.ID, sctx.Run.Branch, firstSubmitted, baseSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sctx.DB.UpdateRunHeadSHA(earlier.ID, firstHead); err != nil {
+		t.Fatal(err)
+	}
+	review, err := sctx.DB.InsertStepResult(sctx.Run.ID, types.StepReview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	findings := `{"findings":[` +
+		`{"id":"review-1","severity":"error","file":"feature.txt","line":1,"description":"worker bug","action":"auto-fix"},` +
+		`{"id":"review-2","severity":"error","file":"feature.txt","line":2,"description":"earlier pipeline bug","action":"auto-fix"},` +
+		`{"id":"review-3","severity":"error","file":"feature.txt","line":3,"description":"later worker bug","action":"auto-fix"}` +
+		`],"summary":"3","risk_level":"low"}`
+	if _, err := sctx.DB.InsertReviewStepRoundWithProvenance(review.ID, 1, "initial", &findings, nil, headSHA, headSHA, "", nil, nil, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := (&AttributionStep{}).Execute(sctx); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := attribution.UnmarshalRecord(*sctx.Run.AttributionSnapshotJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Counts.OriginalWorker != 2 || rec.Counts.Unknown != 1 || rec.Counts.Pipeline != 0 {
+		t.Fatalf("counts = %+v bugs=%+v gaps=%v", rec.Counts, rec.Bugs, rec.EvidenceGaps)
+	}
+	for _, bug := range rec.Bugs {
+		want := types.AttributionOriginalWorker
+		if bug.Description == "earlier pipeline bug" {
+			want = types.AttributionUnknown
+		}
+		if bug.Attribution != want {
+			t.Fatalf("%s attributed %s, want %s: %+v", bug.Description, bug.Attribution, want, bug)
+		}
+	}
+	if !strings.Contains(strings.Join(rec.EvidenceGaps, "\n"), earlier.ID) {
+		t.Fatalf("gaps do not name the earlier run: %v", rec.EvidenceGaps)
+	}
+}
+
 var _ pipeline.Step = (*AttributionStep)(nil)

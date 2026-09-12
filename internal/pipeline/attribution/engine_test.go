@@ -1120,6 +1120,118 @@ func TestSnapshot_RerunGateHeadLinesAreUnknownNotWorker(t *testing.T) {
 	}
 }
 
+// A fresh push after `no-mistakes sync` submits a head that already carries an
+// earlier run's pipeline commits. Those lines are read from the earlier run's
+// recorded submitted..head span and are unknown, not the worker's; the lines
+// the worker wrote before that run and after syncing stay the worker's.
+func TestSnapshot_SyncedEarlierRunPipelineLinesAreUnknownNotWorker(t *testing.T) {
+	dir, _, firstSubmitted, firstHead := repoWithWorkerBugAndPipelineFix(t)
+	submitted := commitFile(t, dir, "handler.go", "package handler\nfunc worker() {}\nfunc pipelineFix() {}\nfunc later() {}\n", "worker change after sync")
+	in := fixtureInput(t, dir, submitted, submitted)
+	earlier := insertPriorRun(t, in, "feature", firstSubmitted, firstHead)
+	abandonedHead := gitCmd(t, dir, "commit-tree", firstSubmitted+"^{tree}", "-p", firstSubmitted, "-m", "superseded pipeline commit")
+	insertPriorRun(t, in, "feature", firstSubmitted, abandonedHead)
+	insertPriorRun(t, in, "other", firstSubmitted, firstHead)
+	review := insertStep(t, in, types.StepReview, types.StepStatusCompleted)
+	insertRound(t, in, review, 1, "initial", findingsJSON(
+		types.Finding{ID: "review-1", Severity: types.FindingSeverityError, File: "handler.go", Line: 2, Description: "first worker bug", Action: types.ActionAutoFix},
+		types.Finding{ID: "review-2", Severity: types.FindingSeverityError, File: "handler.go", Line: 3, Description: "earlier pipeline bug", Action: types.ActionAutoFix},
+		types.Finding{ID: "review-3", Severity: types.FindingSeverityError, File: "handler.go", Line: 4, Description: "later worker bug", Action: types.ActionAutoFix},
+		types.Finding{ID: "review-4", Severity: types.FindingSeverityError, File: "base.go", Line: 2, Description: "pre-existing off-by-one", Action: types.ActionAutoFix},
+	), submitted, false, false)
+
+	rec, err := Snapshot(context.Background(), in.Input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Counts.OriginalWorker != 2 || rec.Counts.Unknown != 1 || rec.Counts.Pipeline != 0 || rec.Counts.PreExisting != 1 {
+		t.Fatalf("counts = %+v bugs=%+v", rec.Counts, rec.Bugs)
+	}
+	byDesc := bugsByDescription(rec)
+	if got := byDesc["earlier pipeline bug"]; got.Attribution != types.AttributionUnknown || got.Confidence != types.AttributionConfidenceUnknown {
+		t.Fatalf("earlier run's pipeline line was claimed for the worker: %+v", got)
+	}
+	if got := byDesc["earlier pipeline bug"]; !strings.Contains(strings.Join(got.Evidence, "\n"), earlier.ID) {
+		t.Fatalf("evidence does not name the earlier run: %+v", got)
+	}
+	for _, desc := range []string{"first worker bug", "later worker bug"} {
+		if got := byDesc[desc]; got.Attribution != types.AttributionOriginalWorker || got.Confidence != types.AttributionConfidenceHigh {
+			t.Fatalf("%s = %+v, want original_worker/high", desc, got)
+		}
+	}
+	if !containsGap(rec, earlier.ID) || rec.Status == types.AttributionStatusComplete {
+		t.Fatalf("status = %s gaps = %v", rec.Status, rec.EvidenceGaps)
+	}
+	if containsGap(rec, abandonedHead[:12]) {
+		t.Fatalf("a superseded run outside the submitted history was applied: %v", rec.EvidenceGaps)
+	}
+}
+
+// When the earlier run's submitted head is no longer in the repository its
+// pipeline span cannot be bounded, so everything the branch had at that run's
+// recorded head is unknown; only lines added after it are the worker's.
+func TestSnapshot_EarlierRunWithoutSubmittedHeadLeavesItsWholeHeadUnknown(t *testing.T) {
+	dir, _, _, firstHead := repoWithWorkerBugAndPipelineFix(t)
+	submitted := commitFile(t, dir, "handler.go", "package handler\nfunc worker() {}\nfunc pipelineFix() {}\nfunc later() {}\n", "worker change after sync")
+	in := fixtureInput(t, dir, submitted, submitted)
+	insertPriorRun(t, in, "feature", "1111111111111111111111111111111111111111", firstHead)
+	review := insertStep(t, in, types.StepReview, types.StepStatusCompleted)
+	insertRound(t, in, review, 1, "initial", findingsJSON(
+		types.Finding{ID: "review-1", Severity: types.FindingSeverityError, File: "handler.go", Line: 2, Description: "first worker bug", Action: types.ActionAutoFix},
+		types.Finding{ID: "review-2", Severity: types.FindingSeverityError, File: "handler.go", Line: 3, Description: "earlier pipeline bug", Action: types.ActionAutoFix},
+		types.Finding{ID: "review-3", Severity: types.FindingSeverityError, File: "handler.go", Line: 4, Description: "later worker bug", Action: types.ActionAutoFix},
+	), submitted, false, false)
+
+	rec, err := Snapshot(context.Background(), in.Input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byDesc := bugsByDescription(rec)
+	for _, desc := range []string{"first worker bug", "earlier pipeline bug"} {
+		if got := byDesc[desc]; got.Attribution != types.AttributionUnknown {
+			t.Fatalf("%s = %+v, want unknown", desc, got)
+		}
+	}
+	if got := byDesc["later worker bug"]; got.Attribution != types.AttributionOriginalWorker {
+		t.Fatalf("later worker bug = %+v, want original_worker", got)
+	}
+}
+
+// The final record reads the earlier runs from the database itself, so a bug
+// first reported after the snapshot is downgraded the same way.
+func TestReconcileRun_ReadsEarlierRunsFromTheDatabase(t *testing.T) {
+	dir, _, firstSubmitted, firstHead := repoWithWorkerBugAndPipelineFix(t)
+	submitted := commitFile(t, dir, "handler.go", "package handler\nfunc worker() {}\nfunc pipelineFix() {}\nfunc later() {}\n", "worker change after sync")
+	in := fixtureInput(t, dir, submitted, submitted)
+	insertPriorRun(t, in, "feature", firstSubmitted, firstHead)
+	insertStep(t, in, types.StepAttribution, types.StepStatusCompleted)
+	snapshot, err := Snapshot(context.Background(), in.Input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := MarshalRecord(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := in.DB.SetRunAttributionSnapshot(in.Run.ID, raw); err != nil {
+		t.Fatal(err)
+	}
+	in.Run.AttributionSnapshotJSON = &raw
+	seedReviewFinding(t, in, "handler.go", 3, "earlier pipeline bug", types.ActionAutoFix, false, submitted)
+	in.Run.Status = types.RunCompleted
+
+	if err := ReconcileRun(context.Background(), in.DB, in.Run, in.Repo, dir); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := UnmarshalRecord(*in.Run.AttributionJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bugsByDescription(rec)["earlier pipeline bug"]; got.Attribution != types.AttributionUnknown {
+		t.Fatalf("final record claimed the earlier run's pipeline line for the worker: %+v", got)
+	}
+}
+
 func TestSkippedRecordIsNotClean(t *testing.T) {
 	dir, _, submitted, head := repoWithWorkerBugAndPipelineFix(t)
 	in := fixtureInput(t, dir, submitted, head)
@@ -1217,6 +1329,22 @@ func fixtureInput(t *testing.T, dir, submitted, head string) *testEnv {
 		},
 		DB: database,
 	}
+}
+
+// insertPriorRun records an earlier run the way the daemon does: submitted at
+// one head and advanced to another by its own pipeline commits.
+func insertPriorRun(t *testing.T, in *testEnv, branch, submitted, head string) *db.Run {
+	t.Helper()
+	run, err := in.DB.InsertRun(in.Repo.ID, branch, submitted, zeroSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := in.DB.UpdateRunHeadSHA(run.ID, head); err != nil {
+		t.Fatal(err)
+	}
+	run.HeadSHA = head
+	in.PriorRuns = append(in.PriorRuns, run)
+	return run
 }
 
 func insertStep(t *testing.T, in *testEnv, name types.StepName, status types.StepStatus) *db.StepResult {

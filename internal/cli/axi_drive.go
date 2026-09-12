@@ -253,6 +253,10 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 				return emitError(cmd, 2, err.Error(),
 					"Omit --base-branch to reattach, or abort the active run before starting a new one")
 			}
+			if err := conflictingActiveRunLaunchAttribution(active, workerProvenance, fixesRunID); err != nil {
+				return emitError(cmd, 2, err.Error(),
+					"Omit --worker-provenance and --fixes-run to reattach, or abort the active run before starting a new one")
+			}
 			runID = active.ID
 		}
 	}
@@ -380,6 +384,50 @@ func conflictingActiveRunPRBaseBranch(run *ipc.RunInfo, requested string) error 
 		return fmt.Errorf("active run %s is already in progress without --base-branch %s", run.ID, requested)
 	}
 	return fmt.Errorf("active run %s is already targeting %s, not %s", run.ID, stored, requested)
+}
+
+// conflictingActiveRunLaunchAttribution reports when reattaching would
+// silently discard a --worker-provenance or --fixes-run that the active run
+// did not record: entry provenance is written once at launch, so a value the
+// run does not already carry can never reach its attribution record.
+func conflictingActiveRunLaunchAttribution(run *ipc.RunInfo, workerProvenance, fixesRunID string) error {
+	if run == nil {
+		return nil
+	}
+	if requested := strings.TrimSpace(fixesRunID); requested != "" {
+		stored := ""
+		if run.FixesRunID != nil {
+			stored = strings.TrimSpace(*run.FixesRunID)
+		}
+		switch {
+		case stored == requested:
+		case stored == "":
+			return fmt.Errorf("active run %s is already in progress without --fixes-run %s", run.ID, requested)
+		default:
+			return fmt.Errorf("active run %s is already linked to --fixes-run %s, not %s", run.ID, stored, requested)
+		}
+	}
+	requested, err := validateWorkerProvenance(workerProvenance)
+	if err != nil {
+		return err
+	}
+	if requested == "" {
+		return nil
+	}
+	stored := ""
+	if run.WorkerProvenanceJSON != nil {
+		if stored, err = validateWorkerProvenance(*run.WorkerProvenanceJSON); err != nil {
+			return fmt.Errorf("active run %s recorded unreadable worker provenance: %w", run.ID, err)
+		}
+	}
+	switch {
+	case stored == requested:
+		return nil
+	case stored == "":
+		return fmt.Errorf("active run %s is already in progress without --worker-provenance", run.ID)
+	default:
+		return fmt.Errorf("active run %s already records a different --worker-provenance", run.ID)
+	}
 }
 
 func activeRunInfo(ctx context.Context, env *axiEnv, branch, headSHA string) (*ipc.RunInfo, error) {

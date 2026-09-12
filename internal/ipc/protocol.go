@@ -331,7 +331,13 @@ type RunInfo struct {
 	CIReadyNoCI      bool            `json:"ci_ready_no_ci,omitempty"`
 	// PRBaseBranch is the per-run PR target override, if the operator set
 	// --base-branch when starting this run.
-	PRBaseBranch            *string `json:"pr_base_branch,omitempty"`
+	PRBaseBranch *string `json:"pr_base_branch,omitempty"`
+	// WorkerProvenanceJSON and FixesRunID are the entry provenance recorded
+	// at launch, exposed so a reattaching `axi run` can refuse to silently
+	// drop a differing --worker-provenance or --fixes-run, as it does for
+	// --base-branch. Empty on legacy runs and when the launch supplied none.
+	WorkerProvenanceJSON    *string `json:"worker_provenance,omitempty"`
+	FixesRunID              *string `json:"fixes_run_id,omitempty"`
 	AttributionJSON         *string `json:"attribution,omitempty"`
 	AttributionSnapshotJSON *string `json:"attribution_snapshot,omitempty"`
 	// AwaitingAgent is true while the run is parked at a gate awaiting the

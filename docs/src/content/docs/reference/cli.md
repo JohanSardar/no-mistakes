@@ -142,6 +142,7 @@ When starting a new run, `axi run` refuses the default branch and uncommitted wo
 Ordinary reattachment to an in-flight run does not require `--intent`; [strict launch receipts](#strict-launch-receipts) require the original intent bytes on every retry.
 `--base-branch` is persisted on the run so rebase, PR, and CI honor it after resume.
 Reattaching with a `--base-branch` that differs from the active run's stored target is refused rather than silently discarded; omit the flag to reattach, or abort the active run first.
+`--worker-provenance` and `--fixes-run` are refused the same way when the active run did not record them or recorded different values: entry provenance is written once at launch, so a value the run does not carry would otherwise vanish from its attribution record.
 Ordinary reattachment accepts either the run's immutable submitted head or its current pipeline head, so pipeline-created fix commits do not detach an unchanged submitting worktree.
 When neither identity matches, `axi run` keeps the fresh-run path but refuses a gate push while `branch_sync` says the pipeline still owns the branch.
 That refusal returns the complete structured state and its `continue_active_run` or `recover_custody` next action instead of a raw Git non-fast-forward.
