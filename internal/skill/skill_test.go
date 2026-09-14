@@ -71,6 +71,23 @@ func TestBodyDocumentsTaskFirstFlow(t *testing.T) {
 	}
 }
 
+func TestBodyDocumentsWorkerProvenance(t *testing.T) {
+	md := Markdown()
+	for _, want := range []string{
+		"## Record who did the work",
+		"`--worker-provenance`",
+		"identity you actually know",
+		"omit any field you would have to guess",
+		"never invent\na model name",
+		"`--fixes-run <run-id>`",
+		"Free-text\nintent is never that link",
+	} {
+		if !strings.Contains(md, want) {
+			t.Errorf("body should tell the driving agent how to record provenance truthfully: missing %q", want)
+		}
+	}
+}
+
 func TestBodyDocumentsAxiGateGuidance(t *testing.T) {
 	md := Markdown()
 	for _, want := range []string{

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -144,6 +146,82 @@ func TestRerunCallerHeadGitStates(t *testing.T) {
 	}
 }
 
+// A --fixes-run that names no run of this repository is refused before the
+// push: the gate hook is post-receive, so a daemon-side refusal would leave
+// the gate ref moved with no run to gate it.
+func TestAxiRunRefusesBadFixesRunBeforePush(t *testing.T) {
+	fx := newAxiTimeoutFixture(t, axiTimeoutOpts{})
+	fx.setGetActive(func(context.Context) (*ipc.RunInfo, error) { return nil, nil })
+	p, err := paths.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	local, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := git.FindGitRoot(local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := d.GetRepoByPath(root)
+	if err != nil || repo == nil {
+		t.Fatalf("registered repo: %+v err=%v", repo, err)
+	}
+	gateDir := p.RepoDir(repo.ID)
+	cliGit(t, local, "clone", "--bare", local, gateDir)
+	cliGit(t, gateDir, "config", "receive.advertisePushOptions", "true")
+	cliGit(t, local, "remote", "add", gate.RemoteName, gateDir)
+	gateHead := cliGit(t, gateDir, "rev-parse", "refs/heads/feature/timeout")
+	cliGit(t, local, "commit", "--allow-empty", "-m", "repair")
+	if cliGit(t, local, "rev-parse", "HEAD") == gateHead {
+		t.Fatal("fixture did not advance the local head past the gate")
+	}
+
+	for _, tc := range []struct {
+		name  string
+		runID string
+		run   *ipc.RunInfo
+	}{
+		{name: "unknown_run", runID: "no-such-run"},
+		{name: "run_in_another_repository", runID: "foreign-run", run: &ipc.RunInfo{ID: "foreign-run", RepoID: "other-repo", Branch: "main"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx.setGetRun(func(_ context.Context, _ int) (*ipc.RunInfo, error) {
+				if tc.run == nil {
+					return nil, fmt.Errorf("run not found: %s", tc.runID)
+				}
+				return tc.run, nil
+			})
+			out, err := executeCmd("axi", "run", "--intent", "repair the earlier bug", "--fixes-run", tc.runID)
+			var ee *exitError
+			if !errors.As(err, &ee) || ee.code != 2 {
+				t.Fatalf("err = %v, want exit 2\n%s", err, out)
+			}
+			if !strings.Contains(out, "--fixes-run") || !strings.Contains(out, tc.runID+`\" is not a run in this repository`) {
+				t.Fatalf("missing structured refusal:\n%s", out)
+			}
+			if got := cliGit(t, gateDir, "rev-parse", "refs/heads/feature/timeout"); got != gateHead {
+				t.Fatalf("refused launch moved the gate ref to %s, want %s", got, gateHead)
+			}
+		})
+	}
+
+	fx.setGetRun(func(context.Context, int) (*ipc.RunInfo, error) {
+		return &ipc.RunInfo{ID: "earlier-run", RepoID: repo.ID, Branch: "feature/timeout"}, nil
+	})
+	client := dialReady(t, p.Socket())
+	defer client.Close()
+	if err := validateAxiRunFixesRun(&axiEnv{p: p, d: d, repo: repo, client: client}, "earlier-run"); err != nil {
+		t.Fatalf("a run of this repository was refused: %v", err)
+	}
+}
+
 func TestRerunSendsOnlyCleanCallerHead(t *testing.T) {
 	for _, dirty := range []bool{false, true} {
 		name := "clean"
@@ -252,7 +330,7 @@ func TestRerunSendsOnlyCleanCallerHead(t *testing.T) {
 				env := &axiEnv{p: p, d: d, repo: repo, cfg: config.DefaultGlobalConfig(), client: client}
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
-				runID, err := triggerRun(ctx, env, "main", nil, "keep the caller's changes", "")
+				runID, err := triggerRun(ctx, env, "main", nil, "keep the caller's changes", "", "", "")
 				if err != nil || runID != "rerun-1" {
 					t.Fatalf("no-op push fallback: run=%s err=%v", runID, err)
 				}
@@ -273,7 +351,7 @@ func TestRerunSendsOnlyCleanCallerHead(t *testing.T) {
 						}
 						ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 						defer cancel()
-						if _, err := triggerRun(ctx, env, "main", nil, "keep the caller's changes", ""); err != nil {
+						if _, err := triggerRun(ctx, env, "main", nil, "keep the caller's changes", "", "", ""); err != nil {
 							t.Fatal(err)
 						}
 						params := <-requests

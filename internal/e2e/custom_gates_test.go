@@ -298,6 +298,7 @@ func assertGatedPipelineOrder(t *testing.T, steps []ipc.StepResultInfo) {
 		types.StepTest,
 		gateRegistryStep,
 		types.StepDocument,
+		types.StepAttribution,
 		types.StepLint,
 		types.StepPush,
 		types.StepPR,

@@ -204,7 +204,7 @@ func newAxiLogsCmd() *cobra.Command {
 			return runAxiLogs(cmd, step, runID, full)
 		},
 	}
-	cmd.Flags().StringVar(&step, "step", "", "step name: intent, rebase, review, test, document, lint, push, pr, ci, or a repository gate step name (required)")
+	cmd.Flags().StringVar(&step, "step", "", "step name: intent, rebase, review, test, document, attribution, lint, push, pr, ci, or a repository gate step name (required)")
 	cmd.Flags().StringVar(&runID, "run", "", "run ID (default: current branch's active or most recent)")
 	cmd.Flags().BoolVar(&full, "full", false, "show the entire log instead of the tail")
 	return cmd
@@ -214,7 +214,7 @@ func newAxiLogsCmd() *cobra.Command {
 // repository gate keeps its own step log, and the truncation marker a failing
 // command gate emits tells the operator to read it with exactly this command,
 // so the gate names have to be accepted here.
-const validLogStepsHelp = "Valid steps: intent, rebase, review, test, document, lint, push, pr, ci, " +
+const validLogStepsHelp = "Valid steps: intent, rebase, review, test, document, attribution, lint, push, pr, ci, " +
 	"or a repository gate step name as shown in `no-mistakes axi status` (for example gate.test.mutation-budget)"
 
 // runAxiLogs renders a step log. It is a read-only query: it does not emit

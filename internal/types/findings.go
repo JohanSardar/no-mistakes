@@ -103,6 +103,11 @@ const (
 	FindingCategoryCIReviewBot     = "ci-review-bot"
 )
 
+// FindingCategoryTestVerdict marks the Test step's live-validation verdict
+// roll-up: one finding summarising the scenario outcomes, not a defect of its
+// own beside the scenario findings it summarises.
+const FindingCategoryTestVerdict = "test-verdict"
+
 // Test scenario result constants: the vocabulary the test step's evidence
 // prompt instructs the agent to use for each derived scenario.
 //

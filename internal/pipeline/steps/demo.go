@@ -73,6 +73,12 @@ func DemoSteps() []pipeline.Step {
 			log:        "Checking documentation coverage...\nScanning changed files for doc gaps...\nAll documentation is up to date.",
 		},
 		&demoStep{
+			name:       types.StepAttribution,
+			delay:      2 * time.Second,
+			displayDur: 6 * time.Second,
+			log:        "Attributing confirmed findings to original worker, pipeline, pre-existing, or unknown...",
+		},
+		&demoStep{
 			name:       types.StepLint,
 			delay:      3 * time.Second,
 			fixDelay:   2 * time.Second,

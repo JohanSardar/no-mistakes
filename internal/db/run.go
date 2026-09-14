@@ -82,11 +82,32 @@ type Run struct {
 	// It is set by the operator (axi run --base-branch) and takes precedence
 	// over pr.base_branch in repo config for this run only.
 	PRBaseBranch *string
-	CreatedAt    int64
-	UpdatedAt    int64
+	// WorkerProvenanceJSON is the caller-supplied originating worker identity
+	// recorded at entry. Nil means unknown (legacy runs and callers that
+	// supplied none).
+	WorkerProvenanceJSON *string
+	// FixesRunID is the typed signal that this run is a later bug-fix of an
+	// earlier run in the same repository. Nil/empty means this is not a
+	// bug-fix run; free-text intent never sets it.
+	FixesRunID *string
+	// Rerun is true when a rerun submitted a gate head that no worker launch
+	// on the branch had submitted: it may already carry an earlier run's
+	// pipeline commits, so attribution cannot split the lines it carried
+	// between the worker and that pipeline. A rerun of the exact head the
+	// worker pushed is the worker's submission again and is not marked.
+	Rerun bool
+	// AttributionSnapshotJSON is the pre-Lint observational record. Nil on
+	// legacy runs and when the attribution step did not run.
+	AttributionSnapshotJSON *string
+	// AttributionJSON is the reconciled final record. Nil on legacy runs and
+	// when no snapshot was taken. A later bug-fix run never rewrites another
+	// run's snapshot or final JSON.
+	AttributionJSON *string
+	CreatedAt       int64
+	UpdatedAt       int64
 }
 
-const runColumns = `id, repo_id, branch, head_sha, base_sha, worktree_dir, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, review_approved_head_sha, status, pr_url, pr_state, pr_state_observed_at, ci_ready_at, COALESCE(ci_ready_no_ci, 0), last_pushed_sha, push_target_kind, push_target_fingerprint, push_ref, last_pushed_at, push_generation, COALESCE(push_active, 0), terminal_head_verified_at, custody_returned_at, error, awaiting_agent_since, COALESCE(parked_ms, 0), intent, intent_source, intent_session_id, intent_score, launch_nonce, launch_validation_generation, launch_intent_digest, launch_receipt_claimed_at, pr_base_branch, created_at, updated_at`
+const runColumns = `id, repo_id, branch, head_sha, base_sha, worktree_dir, submitted_head_sha, no_mistakes_version, no_mistakes_build_sha, review_approved_head_sha, status, pr_url, pr_state, pr_state_observed_at, ci_ready_at, COALESCE(ci_ready_no_ci, 0), last_pushed_sha, push_target_kind, push_target_fingerprint, push_ref, last_pushed_at, push_generation, COALESCE(push_active, 0), terminal_head_verified_at, custody_returned_at, error, awaiting_agent_since, COALESCE(parked_ms, 0), intent, intent_source, intent_session_id, intent_score, launch_nonce, launch_validation_generation, launch_intent_digest, launch_receipt_claimed_at, pr_base_branch, worker_provenance_json, fixes_run_id, COALESCE(rerun, 0), attribution_snapshot_json, attribution_json, created_at, updated_at`
 
 func scanRun(row interface {
 	Scan(...any) error
@@ -100,6 +121,7 @@ func scanRun(row interface {
 		&r.Intent, &r.IntentSource, &r.IntentSessionID, &r.IntentScore,
 		&r.LaunchNonce, &r.LaunchValidationGeneration, &r.LaunchIntentDigest, &r.LaunchReceiptClaimedAt,
 		&r.PRBaseBranch,
+		&r.WorkerProvenanceJSON, &r.FixesRunID, &r.Rerun, &r.AttributionSnapshotJSON, &r.AttributionJSON,
 		&r.CreatedAt, &r.UpdatedAt,
 	)
 }
@@ -1085,6 +1107,47 @@ func (d *DB) SetRunCIRerunState(id, state string) error {
 	_, err := d.sql.Exec(`UPDATE runs SET ci_rerun_state = ?, updated_at = ? WHERE id = ?`, state, now(), id)
 	if err != nil {
 		return fmt.Errorf("set run ci rerun state: %w", err)
+	}
+	return nil
+}
+
+// SetRunLaunchAttribution records entry provenance. workerJSON may be empty
+// (unknown worker). fixesRunID is the typed bug-fix signal; empty clears it.
+// rerun marks a launch whose submitted head is the gate head (see Run.Rerun).
+func (d *DB) SetRunLaunchAttribution(id, workerJSON, fixesRunID string, rerun bool) error {
+	var worker, fixes any
+	if strings.TrimSpace(workerJSON) != "" {
+		worker = workerJSON
+	}
+	if strings.TrimSpace(fixesRunID) != "" {
+		fixes = strings.TrimSpace(fixesRunID)
+	}
+	_, err := d.sql.Exec(
+		`UPDATE runs SET worker_provenance_json = ?, fixes_run_id = ?, rerun = ?, updated_at = ? WHERE id = ?`,
+		worker, fixes, rerun, now(), id,
+	)
+	if err != nil {
+		return fmt.Errorf("set run launch attribution: %w", err)
+	}
+	return nil
+}
+
+// SetRunAttributionSnapshot stores the pre-Lint observational record without
+// touching the final record, so later reconciliation cannot erase the snapshot.
+func (d *DB) SetRunAttributionSnapshot(id, snapshotJSON string) error {
+	_, err := d.sql.Exec(`UPDATE runs SET attribution_snapshot_json = ?, updated_at = ? WHERE id = ?`, snapshotJSON, now(), id)
+	if err != nil {
+		return fmt.Errorf("set run attribution snapshot: %w", err)
+	}
+	return nil
+}
+
+// SetRunAttributionFinal stores the reconciled record. It never writes the
+// snapshot column.
+func (d *DB) SetRunAttributionFinal(id, attributionJSON string) error {
+	_, err := d.sql.Exec(`UPDATE runs SET attribution_json = ?, updated_at = ? WHERE id = ?`, attributionJSON, now(), id)
+	if err != nil {
+		return fmt.Errorf("set run attribution final: %w", err)
 	}
 	return nil
 }

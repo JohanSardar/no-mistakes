@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -125,6 +126,14 @@ func newDaemonNotifyPushCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			workerProvenance, err := parseWorkerProvenancePushOptions(pushOptions)
+			if err != nil {
+				return err
+			}
+			fixesRunID, err := parseFixesRunPushOptions(pushOptions)
+			if err != nil {
+				return err
+			}
 			gatePath, err := normalizeNotifyGatePath(gate)
 			if err != nil {
 				return err
@@ -153,6 +162,8 @@ func newDaemonNotifyPushCmd() *cobra.Command {
 				ValidationGeneration:   validationGeneration,
 				PRBaseBranch:           prBaseBranch,
 				ReconciledPreviousHead: reconciledPreviousHead,
+				WorkerProvenance:       jsonRawIfAny(workerProvenance),
+				FixesRunID:             fixesRunID,
 			}, &result)
 		},
 	}
@@ -370,6 +381,70 @@ func isHexCommitSHA(value string) bool {
 		}
 	}
 	return true
+}
+
+const workerProvenancePushOptionPrefix = "no-mistakes.worker-provenance="
+const fixesRunPushOptionPrefix = "no-mistakes.fixes-run="
+
+func formatWorkerProvenancePushOption(raw string) string {
+	return formatOpaquePushOption(workerProvenancePushOptionPrefix, strings.TrimSpace(raw))
+}
+
+func formatFixesRunPushOption(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ""
+	}
+	return fixesRunPushOptionPrefix + id
+}
+
+func parseWorkerProvenancePushOptions(options []string) (string, error) {
+	return parseOpaquePushOptions(options, workerProvenancePushOptionPrefix, "worker provenance")
+}
+
+func parseFixesRunPushOptions(options []string) (string, error) {
+	id := ""
+	for _, option := range options {
+		value, ok := strings.CutPrefix(option, fixesRunPushOptionPrefix)
+		if !ok {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return "", fmt.Errorf("fixes-run push option must not be empty")
+		}
+		if id != "" && id != value {
+			return "", fmt.Errorf("conflicting fixes-run push options")
+		}
+		id = value
+	}
+	return id, nil
+}
+
+func jsonRawIfAny(s string) json.RawMessage {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	return json.RawMessage(s)
+}
+
+// validateWorkerProvenance returns the canonical encoding of the supplied
+// worker identity, which is what the daemon stores; an object naming nothing
+// is the same as no flag.
+func validateWorkerProvenance(raw string) (string, error) {
+	parsed, err := types.ParseWorkerProvenance(raw)
+	if err != nil {
+		return "", err
+	}
+	if parsed == nil {
+		return "", nil
+	}
+	encoded, err := json.Marshal(parsed)
+	if err != nil {
+		return "", fmt.Errorf("encode worker provenance: %w", err)
+	}
+	return string(encoded), nil
 }
 
 func formatSkipPushOptions(steps []types.StepName) []string {

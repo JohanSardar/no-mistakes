@@ -84,6 +84,11 @@ type PushReceivedParams struct {
 	// branch, so the hook reports no previous head of its own. It is a claim the
 	// daemon accepts only against the gate's own archive tag.
 	ReconciledPreviousHead string `json:"reconciled_previous_head,omitempty"`
+	// WorkerProvenance is caller-supplied originating worker identity (JSON).
+	// Empty means unknown. FixesRunID is the typed signal that this run is a
+	// later bug-fix of an earlier run in the same repository.
+	WorkerProvenance json.RawMessage `json:"worker_provenance,omitempty"`
+	FixesRunID       string          `json:"fixes_run_id,omitempty"`
 }
 
 // StartFreshRunParams requests a nonce-bound fresh launch for one exact gate
@@ -98,6 +103,8 @@ type StartFreshRunParams struct {
 	LaunchNonce          string           `json:"launch_nonce"`
 	ValidationGeneration string           `json:"validation_generation"`
 	PRBaseBranch         string           `json:"pr_base_branch,omitempty"`
+	WorkerProvenance     json.RawMessage  `json:"worker_provenance,omitempty"`
+	FixesRunID           string           `json:"fixes_run_id,omitempty"`
 }
 
 // ClaimLaunchReceiptParams identifies one exact opaque receipt binding.
@@ -170,7 +177,9 @@ type RerunParams struct {
 	PRBaseBranch  string           `json:"pr_base_branch,omitempty"`
 	// CallerHeadSHA is a clean caller worktree's HEAD, when known. It guards
 	// the daemon's selected head; it never supplies a replacement run head.
-	CallerHeadSHA string `json:"caller_head_sha,omitempty"`
+	CallerHeadSHA    string          `json:"caller_head_sha,omitempty"`
+	WorkerProvenance json.RawMessage `json:"worker_provenance,omitempty"`
+	FixesRunID       string          `json:"fixes_run_id,omitempty"`
 }
 
 // SubscribeParams starts an event stream for a run.
@@ -323,6 +332,14 @@ type RunInfo struct {
 	// PRBaseBranch is the per-run PR target override, if the operator set
 	// --base-branch when starting this run.
 	PRBaseBranch *string `json:"pr_base_branch,omitempty"`
+	// WorkerProvenanceJSON and FixesRunID are the entry provenance recorded
+	// at launch, exposed so a reattaching `axi run` can refuse to silently
+	// drop a differing --worker-provenance or --fixes-run, as it does for
+	// --base-branch. Empty on legacy runs and when the launch supplied none.
+	WorkerProvenanceJSON    *string `json:"worker_provenance,omitempty"`
+	FixesRunID              *string `json:"fixes_run_id,omitempty"`
+	AttributionJSON         *string `json:"attribution,omitempty"`
+	AttributionSnapshotJSON *string `json:"attribution_snapshot,omitempty"`
 	// AwaitingAgent is true while the run is parked at a gate awaiting the
 	// driving agent's response. AwaitingAgentSince is the unix-seconds time it
 	// parked, so a supervisor can read "parked for N seconds" in one call. Both

@@ -28,8 +28,8 @@ import (
 //     hook installation)
 //   - `git push no-mistakes <branch>` (real git transport, hook fires,
 //     daemon receives push notification)
-//   - the eight pipeline steps in sequence (rebase, review, test,
-//     document, lint, push, pr, ci)
+//   - the nine pipeline steps in sequence (rebase, review, test,
+//     document, attribution, lint, push, pr, ci)
 //   - real subprocess invocations of the agent binary, parsed by
 //     no-mistakes' real agent package
 //   - SQLite persistence and IPC retrieval of run state
@@ -2701,7 +2701,7 @@ func assertPushedHead(t *testing.T, runHeadSHA, upstreamHeadSHA string) {
 
 func assertPipelineStepsInOrder(t *testing.T, steps []ipc.StepResultInfo) {
 	t.Helper()
-	expected := []types.StepName{types.StepIntent, types.StepRebase, types.StepReview, types.StepTest, types.StepDocument, types.StepLint, types.StepPush, types.StepPR, types.StepCI}
+	expected := []types.StepName{types.StepIntent, types.StepRebase, types.StepReview, types.StepTest, types.StepDocument, types.StepAttribution, types.StepLint, types.StepPush, types.StepPR, types.StepCI}
 	if len(steps) != len(expected) {
 		t.Fatalf("pipeline recorded %d steps, want %d", len(steps), len(expected))
 	}

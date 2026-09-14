@@ -44,6 +44,11 @@ CREATE TABLE IF NOT EXISTS runs (
     launch_intent_digest TEXT,
     launch_receipt_claimed_at INTEGER,
     pr_base_branch       TEXT,
+    worker_provenance_json TEXT,
+    fixes_run_id           TEXT,
+    rerun                  INTEGER NOT NULL DEFAULT 0,
+    attribution_snapshot_json TEXT,
+    attribution_json          TEXT,
     created_at           INTEGER NOT NULL,
     updated_at           INTEGER NOT NULL
 );
@@ -323,4 +328,11 @@ var migrationStatements = []string{
 	`ALTER TABLE agent_invocations ADD COLUMN workload_files INTEGER`,
 	`ALTER TABLE agent_invocations ADD COLUMN workload_lines INTEGER`,
 	`ALTER TABLE agent_invocations ADD COLUMN finding_count INTEGER`,
+	// Entry provenance and observational attribution. Nullable so historical
+	// runs stay unknown rather than a fabricated clean score.
+	`ALTER TABLE runs ADD COLUMN worker_provenance_json TEXT`,
+	`ALTER TABLE runs ADD COLUMN fixes_run_id TEXT`,
+	`ALTER TABLE runs ADD COLUMN attribution_snapshot_json TEXT`,
+	`ALTER TABLE runs ADD COLUMN attribution_json TEXT`,
+	`ALTER TABLE runs ADD COLUMN rerun INTEGER NOT NULL DEFAULT 0`,
 }

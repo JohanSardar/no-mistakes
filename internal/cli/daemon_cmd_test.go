@@ -159,3 +159,54 @@ func TestReconciledPreviousHeadPushOptionRoundTrip(t *testing.T) {
 		t.Fatal("a non-SHA previous head claim was accepted")
 	}
 }
+
+func TestWorkerProvenancePushOptionRoundTrip(t *testing.T) {
+	raw := `{"tool":"grok","model":"grok-4.6","provider":"xai"}`
+	opt := formatWorkerProvenancePushOption(raw)
+	got, err := parseWorkerProvenancePushOptions([]string{"no-mistakes.skip=lint", opt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != raw {
+		t.Fatalf("got %q want %q", got, raw)
+	}
+}
+
+func TestFixesRunPushOptionRoundTrip(t *testing.T) {
+	opt := formatFixesRunPushOption("run-abc")
+	got, err := parseFixesRunPushOptions([]string{opt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "run-abc" {
+		t.Fatalf("got %q", got)
+	}
+	if _, err := parseFixesRunPushOptions([]string{"no-mistakes.fixes-run=a", "no-mistakes.fixes-run=b"}); err == nil {
+		t.Fatal("conflicting fixes-run options were accepted")
+	}
+}
+
+func TestValidateWorkerProvenance(t *testing.T) {
+	got, err := validateWorkerProvenance(` {"tool":"grok","model":"grok-4.6"} `)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != `{"tool":"grok","model":"grok-4.6"}` {
+		t.Fatalf("provenance = %q", got)
+	}
+	if got, err := validateWorkerProvenance(""); err != nil || got != "" {
+		t.Fatalf("empty flag = %q, %v", got, err)
+	}
+	if _, err := validateWorkerProvenance("{"); err == nil {
+		t.Fatal("invalid JSON was accepted")
+	}
+	if got, err := validateWorkerProvenance(`{"tool":"codex"} x`); err == nil {
+		t.Fatalf("trailing data was accepted as %q", got)
+	}
+	if got, err := validateWorkerProvenance(`{"tool":" codex ","extra":1,"settings": { "effort" : "high" }}`); err != nil || got != `{"tool":"codex","settings":{"effort":"high"}}` {
+		t.Fatalf("canonical provenance = %q, %v", got, err)
+	}
+	if got, err := validateWorkerProvenance(`{"extra":1}`); err != nil || got != "" {
+		t.Fatalf("an object naming nothing = %q, %v", got, err)
+	}
+}

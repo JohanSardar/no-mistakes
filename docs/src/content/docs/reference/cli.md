@@ -19,7 +19,7 @@ no-mistakes --skip test,lint
 
 Unlike `no-mistakes attach`, bare `no-mistakes` only auto-attaches to an active run on the current branch.
 `--skip` only applies when bare `no-mistakes` starts a new pipeline run through the wizard; it does not skip a step on an already-active run.
-The only valid `--skip` step names are `intent`, `rebase`, `review`, `test`, `document`, `lint`, `push`, `pr`, and `ci`. Repository gate names are refused.
+The only valid `--skip` step names are `intent`, `rebase`, `review`, `test`, `document`, `attribution`, `lint`, `push`, `pr`, and `ci`. Repository gate names are refused.
 
 ## no-mistakes init
 
@@ -132,6 +132,8 @@ no-mistakes axi run --intent "the user's goal" --base-branch epic/foo
 | `--wait`        | `duration` | `8m`    | Maximum time for active-run lookup and run driving before the caller must reattach |
 | `--launch-nonce` | `string` | (none) | Non-secret correlation identifier for a durable pre-drive receipt; requires `--validation-generation` |
 | `--validation-generation` | `string` | (none) | Caller-selected validation generation bound to `--launch-nonce`; requires that flag |
+| `--worker-provenance` | `string` | (none) | JSON object of the originating worker identity (`tool`, `model`, `provider`, optional `settings`, `task_id`, `external_run_id`). Unset fields stay unknown. Do not put account identities, private paths, or personal presets in it; it is recorded on the run and appears in status output |
+| `--fixes-run` | `string` | (none) | Typed signal that this run is a later bug-fix of an earlier run ID in the same repository. Free-text intent is never this signal |
 
 `--intent` is not a description of the diff.
 It is the user's goal or request, and no-mistakes uses it verbatim instead of transcript inference.
@@ -140,6 +142,7 @@ When starting a new run, `axi run` refuses the default branch and uncommitted wo
 Ordinary reattachment to an in-flight run does not require `--intent`; [strict launch receipts](#strict-launch-receipts) require the original intent bytes on every retry.
 `--base-branch` is persisted on the run so rebase, PR, and CI honor it after resume.
 Reattaching with a `--base-branch` that differs from the active run's stored target is refused rather than silently discarded; omit the flag to reattach, or abort the active run first.
+`--worker-provenance` and `--fixes-run` are refused the same way when the active run did not record them or recorded different values: entry provenance is written once at launch, so a value the run does not carry would otherwise vanish from its attribution record.
 Ordinary reattachment accepts either the run's immutable submitted head or its current pipeline head, so pipeline-created fix commits do not detach an unchanged submitting worktree.
 When neither identity matches, `axi run` keeps the fresh-run path but refuses a gate push while `branch_sync` says the pipeline still owns the branch.
 That refusal returns the complete structured state and its `continue_active_run` or `recover_custody` next action instead of a raw Git non-fast-forward.
@@ -242,6 +245,7 @@ When the resolved run is parked at an `awaiting_approval` or `fix_review` gate, 
 The field disappears after that run's gate is answered, on cancel, and on terminal outcomes; use it to distinguish a run waiting for the driving agent from one actively running, fixing, or watching CI.
 Status offers branch-scoped `axi respond` commands only for the current branch's implicitly resolved run. An explicitly selected gate stays inspection-only even when its branch matches, because a newer active run on that branch could receive the bare response command instead; the gate remains visible and its log commands retain `--run <id>`.
 When a repository has no configured lint command and Document performs the combined Document/Lint housekeeping invocation, the run object includes `shared_work` evidence naming its `document+lint housekeeping` scope and the duration attributed to Document; Lint's own duration remains the cached-result handoff time.
+When the resolved run has an attribution snapshot or final record, the run object includes `attribution:` with phase, counts, and worker identity; a legacy run without a record omits the block. [Attribution](/no-mistakes/reference/pipeline-steps/#attribution) owns the record contract.
 When the resolved run has a `running` or `fixing` step, the run object includes `active_steps`.
 Each row reports the whole step's elapsed time as `active_for`, the displayed execution or fix round's elapsed time as `round_active_for`, the latest meaningful log or native-agent lifecycle activity, the native agent PID if one is currently running, and the current round such as `round 1`, `auto-fix 1/3`, or `fix 2`.
 `round_active_for` resets when a fix round starts; older active runs created before this timing was recorded show it as empty.
@@ -334,7 +338,7 @@ An unknown explicit run ID exits nonzero with `error: run "<id>" not found` inst
 Without `--full`, long logs show the last 40 lines and a help hint for the full log; when `--run <id>` selected the log, that hint retains the same run ID.
 Step logs include native subprocess agent lifecycle lines such as `codex started pid=4242`, `codex exited pid=4242 status=success`, and transient retry messages when the selected agent supports lifecycle events.
 They also include fix-loop markers such as `auto-fix round 1/3 starting after round 1` and `user-fix round starting after round 2`.
-`--step` accepts the nine core step names and valid repository gate names such as `gate.test.mutation-budget`. Use the exact gate name shown by `axi status`.
+`--step` accepts the ten core step names and valid repository gate names such as `gate.test.mutation-budget`. Use the exact gate name shown by `axi status`.
 
 ## no-mistakes axi abort
 

@@ -49,15 +49,16 @@ func (s RunStatus) Terminal() bool {
 type StepName string
 
 const (
-	StepIntent   StepName = "intent"
-	StepRebase   StepName = "rebase"
-	StepReview   StepName = "review"
-	StepTest     StepName = "test"
-	StepDocument StepName = "document"
-	StepLint     StepName = "lint"
-	StepPush     StepName = "push"
-	StepPR       StepName = "pr"
-	StepCI       StepName = "ci"
+	StepIntent      StepName = "intent"
+	StepRebase      StepName = "rebase"
+	StepReview      StepName = "review"
+	StepTest        StepName = "test"
+	StepDocument    StepName = "document"
+	StepAttribution StepName = "attribution"
+	StepLint        StepName = "lint"
+	StepPush        StepName = "push"
+	StepPR          StepName = "pr"
+	StepCI          StepName = "ci"
 )
 
 func normalizeStepName(s StepName) StepName {
@@ -114,14 +115,16 @@ func (s StepName) Order() int {
 		return 4
 	case StepDocument:
 		return 5
-	case StepLint:
+	case StepAttribution:
 		return 6
-	case StepPush:
+	case StepLint:
 		return 7
-	case StepPR:
+	case StepPush:
 		return 8
-	case StepCI:
+	case StepPR:
 		return 9
+	case StepCI:
+		return 10
 	default:
 		return 0
 	}
@@ -129,7 +132,7 @@ func (s StepName) Order() int {
 
 // AllSteps returns all core pipeline steps in execution order.
 func AllSteps() []StepName {
-	return []StepName{StepIntent, StepRebase, StepReview, StepTest, StepDocument, StepLint, StepPush, StepPR, StepCI}
+	return []StepName{StepIntent, StepRebase, StepReview, StepTest, StepDocument, StepAttribution, StepLint, StepPush, StepPR, StepCI}
 }
 
 func (s StepName) IsCustomGateAnchor() bool {

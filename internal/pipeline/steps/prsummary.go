@@ -1696,6 +1696,8 @@ func stepDisplayName(name types.StepName) string {
 		return "Test"
 	case types.StepDocument:
 		return "Document"
+	case types.StepAttribution:
+		return "Attribution"
 	case types.StepLint:
 		return "Lint"
 	case types.StepPush:

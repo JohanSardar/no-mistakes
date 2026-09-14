@@ -119,6 +119,8 @@ func newAxiRunCmd() *cobra.Command {
 	var launchNonce string
 	var validationGeneration string
 	var baseBranch string
+	var workerProvenance string
+	var fixesRunID string
 	var wait time.Duration
 
 	cmd := &cobra.Command{
@@ -163,9 +165,9 @@ func newAxiRunCmd() *cobra.Command {
 				skipSteps, err := parseSkipSteps(skipValue)
 				if err != nil {
 					return emitError(cmd, 2, err.Error(),
-						"Valid steps: intent, rebase, review, test, document, lint, push, pr, ci")
+						"Valid steps: intent, rebase, review, test, document, attribution, lint, push, pr, ci")
 				}
-				return runAxiRunWithLaunchProof(cmd, autoYes, skipSteps, intent, baseBranch, launchNonce, validationGeneration, wait)
+				return runAxiRunWithLaunchProof(cmd, autoYes, skipSteps, intent, baseBranch, launchNonce, validationGeneration, wait, workerProvenance, fixesRunID)
 			})
 		},
 	}
@@ -175,15 +177,17 @@ func newAxiRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&launchNonce, "launch-nonce", "", "opaque nonce for a daemon-bound pre-drive launch receipt")
 	cmd.Flags().StringVar(&validationGeneration, "validation-generation", "", "opaque generation bound to --launch-nonce proof mode")
 	cmd.Flags().StringVar(&baseBranch, "base-branch", "", "integration branch to open the PR against for this run only (overrides pr.base_branch)")
+	cmd.Flags().StringVar(&workerProvenance, "worker-provenance", "", "JSON object of the originating worker identity (tool/model/provider/settings, optional task_id/external_run_id); unset fields stay unknown")
+	cmd.Flags().StringVar(&fixesRunID, "fixes-run", "", "typed signal that this run is a later bug-fix of an earlier run ID in the same repository")
 	bindAxiWaitFlag(cmd, &wait)
 	return cmd
 }
 
 func runAxiRun(cmd *cobra.Command, autoYes bool, skipSteps []types.StepName, intent, baseBranch string) error {
-	return runAxiRunWithLaunchProof(cmd, autoYes, skipSteps, intent, baseBranch, "", "", defaultAxiWait)
+	return runAxiRunWithLaunchProof(cmd, autoYes, skipSteps, intent, baseBranch, "", "", defaultAxiWait, "", "")
 }
 
-func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []types.StepName, intent, baseBranch, launchNonce, validationGeneration string, wait time.Duration) error {
+func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []types.StepName, intent, baseBranch, launchNonce, validationGeneration string, wait time.Duration, workerProvenance, fixesRunID string) error {
 	if err := validateAxiWait(wait); err != nil {
 		return emitError(cmd, 2, err.Error(), "Pass a positive duration such as --wait 8m")
 	}
@@ -249,6 +253,10 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 				return emitError(cmd, 2, err.Error(),
 					"Omit --base-branch to reattach, or abort the active run before starting a new one")
 			}
+			if err := conflictingActiveRunLaunchAttribution(active, workerProvenance, fixesRunID); err != nil {
+				return emitError(cmd, 2, err.Error(),
+					"Omit --worker-provenance and --fixes-run to reattach, or abort the active run before starting a new one")
+			}
 			runID = active.ID
 		}
 	}
@@ -274,14 +282,21 @@ func runAxiRunWithLaunchProof(cmd *cobra.Command, autoYes bool, skipSteps []type
 		if guard := preflightGuard(ctx, env, branch); guard != nil {
 			return guard(cmd)
 		}
-		var err error
+		workerRaw, err := validateWorkerProvenance(workerProvenance)
+		if err != nil {
+			return emitError(cmd, 2, err.Error())
+		}
+		fixesRunID = strings.TrimSpace(fixesRunID)
+		if err := validateAxiRunFixesRun(env, fixesRunID); err != nil {
+			return emitError(cmd, 2, err.Error())
+		}
 		if launchNonce != "" {
-			launchReceipt, err = triggerProofRun(ctx, env, branch, headSHA, skipSteps, intent, baseBranch, launchNonce, validationGeneration)
+			launchReceipt, err = triggerProofRun(ctx, env, branch, headSHA, skipSteps, intent, baseBranch, launchNonce, validationGeneration, workerRaw, fixesRunID)
 			if err == nil {
 				runID = launchReceipt.RunID
 			}
 		} else {
-			runID, err = triggerRun(ctx, env, branch, skipSteps, intent, baseBranch)
+			runID, err = triggerRun(ctx, env, branch, skipSteps, intent, baseBranch, workerRaw, fixesRunID)
 		}
 		if err != nil {
 			if ownershipErr, ok := err.(*branchOwnershipError); ok {
@@ -327,6 +342,29 @@ func validateAxiRunBaseBranch(ctx context.Context, baseBranch string) error {
 	return steps.VerifyRemoteBranchExists(ctx, ".", normalized)
 }
 
+// validateAxiRunFixesRun checks --fixes-run against the daemon before the
+// push. The gate hook is post-receive, so the daemon's own refusal (its
+// validateFixesRun stays the authoritative check) would otherwise land after
+// the branch head had moved with no run to gate it, and a corrected retry
+// could only rerun a head no launch had recorded as the worker's.
+func validateAxiRunFixesRun(env *axiEnv, fixesRunID string) error {
+	if fixesRunID == "" {
+		return nil
+	}
+	notInRepo := fmt.Errorf("--fixes-run %q is not a run in this repository", fixesRunID)
+	var result ipc.GetRunResult
+	if err := env.client.Call(ipc.MethodGetRun, &ipc.GetRunParams{RunID: fixesRunID}, &result); err != nil {
+		if isExactRunNotFound(err, fixesRunID) {
+			return notInRepo
+		}
+		return fmt.Errorf("--fixes-run: look up run %s: %w", fixesRunID, err)
+	}
+	if result.Run == nil || result.Run.RepoID != env.repo.ID {
+		return notInRepo
+	}
+	return nil
+}
+
 // conflictingActiveRunPRBaseBranch reports when --base-branch would be
 // discarded by reattaching to an in-flight run that already has a different
 // (or empty) per-run PR target.
@@ -346,6 +384,50 @@ func conflictingActiveRunPRBaseBranch(run *ipc.RunInfo, requested string) error 
 		return fmt.Errorf("active run %s is already in progress without --base-branch %s", run.ID, requested)
 	}
 	return fmt.Errorf("active run %s is already targeting %s, not %s", run.ID, stored, requested)
+}
+
+// conflictingActiveRunLaunchAttribution reports when reattaching would
+// silently discard a --worker-provenance or --fixes-run that the active run
+// did not record: entry provenance is written once at launch, so a value the
+// run does not already carry can never reach its attribution record.
+func conflictingActiveRunLaunchAttribution(run *ipc.RunInfo, workerProvenance, fixesRunID string) error {
+	if run == nil {
+		return nil
+	}
+	if requested := strings.TrimSpace(fixesRunID); requested != "" {
+		stored := ""
+		if run.FixesRunID != nil {
+			stored = strings.TrimSpace(*run.FixesRunID)
+		}
+		switch {
+		case stored == requested:
+		case stored == "":
+			return fmt.Errorf("active run %s is already in progress without --fixes-run %s", run.ID, requested)
+		default:
+			return fmt.Errorf("active run %s is already linked to --fixes-run %s, not %s", run.ID, stored, requested)
+		}
+	}
+	requested, err := validateWorkerProvenance(workerProvenance)
+	if err != nil {
+		return err
+	}
+	if requested == "" {
+		return nil
+	}
+	stored := ""
+	if run.WorkerProvenanceJSON != nil {
+		if stored, err = validateWorkerProvenance(*run.WorkerProvenanceJSON); err != nil {
+			return fmt.Errorf("active run %s recorded unreadable worker provenance: %w", run.ID, err)
+		}
+	}
+	switch {
+	case stored == requested:
+		return nil
+	case stored == "":
+		return fmt.Errorf("active run %s is already in progress without --worker-provenance", run.ID)
+	default:
+		return fmt.Errorf("active run %s already records a different --worker-provenance", run.ID)
+	}
 }
 
 func activeRunInfo(ctx context.Context, env *axiEnv, branch, headSHA string) (*ipc.RunInfo, error) {
@@ -505,12 +587,18 @@ func freshRunBranchOwnershipState(ctx context.Context, env *axiEnv) *branchsync.
 // the gate to trigger a pipeline, and falls back to a rerun when the push was a
 // no-op (the gate already had this commit). Callers must check for an existing
 // active run first (see activeRunID) and apply pre-flight guards.
-func triggerRun(ctx context.Context, env *axiEnv, branch string, skipSteps []types.StepName, intent, baseBranch string) (string, error) {
+func triggerRun(ctx context.Context, env *axiEnv, branch string, skipSteps []types.StepName, intent, baseBranch, workerProvenance, fixesRunID string) (string, error) {
 	pushOptions := formatSkipPushOptions(skipSteps)
 	if opt := formatIntentPushOption(intent); opt != "" {
 		pushOptions = append(pushOptions, opt)
 	}
 	if opt := formatPRBaseBranchPushOption(baseBranch); opt != "" {
+		pushOptions = append(pushOptions, opt)
+	}
+	if opt := formatWorkerProvenancePushOption(workerProvenance); opt != "" {
+		pushOptions = append(pushOptions, opt)
+	}
+	if opt := formatFixesRunPushOption(fixesRunID); opt != "" {
 		pushOptions = append(pushOptions, opt)
 	}
 	observedHead, err := git.HeadSHA(ctx, ".")
@@ -576,7 +664,7 @@ func triggerRun(ctx context.Context, env *axiEnv, branch string, skipSteps []typ
 	// No run appeared: the push was likely up-to-date. Refresh the caller's
 	// clean-head evidence because it may have changed while waiting above.
 	var rr ipc.RerunResult
-	params := rerunParams(env.repo.ID, branch, skipSteps, intent, baseBranch)
+	params := rerunParams(env.repo.ID, branch, skipSteps, intent, baseBranch, workerProvenance, fixesRunID)
 	params.CallerHeadSHA, err = rerunCallerHead(ctx)
 	if err != nil {
 		return "", err
@@ -601,7 +689,7 @@ func claimLaunchReceipt(client *ipc.Client, repoID, branch, launchNonce, submitt
 // triggerProofRun captures the immutable submitted commit and waits only for
 // the matching nonce-bound receipt. Ordinary active-run heuristics never prove
 // strict launch identity.
-func triggerProofRun(ctx context.Context, env *axiEnv, branch, headSHA string, skipSteps []types.StepName, intent, baseBranch, launchNonce, validationGeneration string) (*ipc.LaunchReceipt, error) {
+func triggerProofRun(ctx context.Context, env *axiEnv, branch, headSHA string, skipSteps []types.StepName, intent, baseBranch, launchNonce, validationGeneration, workerProvenance, fixesRunID string) (*ipc.LaunchReceipt, error) {
 	pushOptions := formatSkipPushOptions(skipSteps)
 	pushOptions = append(pushOptions,
 		formatIntentPushOption(intent),
@@ -609,6 +697,12 @@ func triggerProofRun(ctx context.Context, env *axiEnv, branch, headSHA string, s
 		formatValidationGenerationPushOption(validationGeneration),
 	)
 	if opt := formatPRBaseBranchPushOption(baseBranch); opt != "" {
+		pushOptions = append(pushOptions, opt)
+	}
+	if opt := formatWorkerProvenancePushOption(workerProvenance); opt != "" {
+		pushOptions = append(pushOptions, opt)
+	}
+	if opt := formatFixesRunPushOption(fixesRunID); opt != "" {
 		pushOptions = append(pushOptions, opt)
 	}
 	if state := freshRunBranchOwnershipState(ctx, env); state != nil {
@@ -630,6 +724,7 @@ func triggerProofRun(ctx context.Context, env *axiEnv, branch, headSHA string, s
 	if err := env.client.Call(ipc.MethodStartFreshRun, &ipc.StartFreshRunParams{
 		RepoID: env.repo.ID, Branch: branch, HeadSHA: headSHA, SkipSteps: skipSteps,
 		Intent: intent, LaunchNonce: launchNonce, ValidationGeneration: validationGeneration, PRBaseBranch: baseBranch,
+		WorkerProvenance: jsonRawIfAny(workerProvenance), FixesRunID: fixesRunID,
 	}, &result); err != nil {
 		return nil, fmt.Errorf("start fresh run: %w", err)
 	}
@@ -737,8 +832,8 @@ func activeRunLookupParams(repoID, branch string) *ipc.GetActiveRunParams {
 	return &ipc.GetActiveRunParams{RepoID: repoID, Branch: branch}
 }
 
-func rerunParams(repoID, branch string, skipSteps []types.StepName, intent, baseBranch string) *ipc.RerunParams {
-	return &ipc.RerunParams{RepoID: repoID, Branch: branch, SkipSteps: skipSteps, Intent: intent, PRBaseBranch: baseBranch}
+func rerunParams(repoID, branch string, skipSteps []types.StepName, intent, baseBranch, workerProvenance, fixesRunID string) *ipc.RerunParams {
+	return &ipc.RerunParams{RepoID: repoID, Branch: branch, SkipSteps: skipSteps, Intent: intent, PRBaseBranch: baseBranch, WorkerProvenance: jsonRawIfAny(workerProvenance), FixesRunID: fixesRunID}
 }
 
 // emitLaunchReceipt writes the proof before driveRun subscribes, so callers

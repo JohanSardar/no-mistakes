@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
@@ -128,6 +129,7 @@ type runView struct {
 	// it to keep a deliberate override from reading identically to a
 	// genuinely green run in agent-facing output.
 	CIOverrideReason string
+	AttributionJSON  string
 }
 
 func runViewFromIPC(r *ipc.RunInfo) runView {
@@ -140,6 +142,11 @@ func runViewFromIPC(r *ipc.RunInfo) runView {
 		CIReadyNoCI:        r.CIReadyNoCI,
 		AwaitingAgentSince: r.AwaitingAgentSince,
 		CIOverrideReason:   r.CIOverrideReason,
+	}
+	if r.AttributionJSON != nil {
+		rv.AttributionJSON = *r.AttributionJSON
+	} else if r.AttributionSnapshotJSON != nil {
+		rv.AttributionJSON = *r.AttributionSnapshotJSON
 	}
 	if r.PRURL != nil {
 		rv.PRURL = *r.PRURL
@@ -185,6 +192,11 @@ func runViewFromDB(r *db.Run, steps []*db.StepResult, database *db.DB) runView {
 	}
 	if r.PRURL != nil {
 		rv.PRURL = *r.PRURL
+	}
+	if r.AttributionJSON != nil {
+		rv.AttributionJSON = *r.AttributionJSON
+	} else if r.AttributionSnapshotJSON != nil {
+		rv.AttributionJSON = *r.AttributionSnapshotJSON
 	}
 	for _, s := range steps {
 		sv := stepView{
@@ -487,6 +499,9 @@ func runObjectFieldWithKey(key string, rv runView) toon.Field {
 	if skips := rv.automaticSkips(); len(skips) > 0 {
 		fields = append(fields, toon.Field{Key: "automatic_skips", Value: skips})
 	}
+	if attr := rv.attributionFields(); len(attr) > 0 {
+		fields = append(fields, toon.Field{Key: "attribution", Value: toon.NewObject(attr...)})
+	}
 	if len(sharedRows) > 0 {
 		fields = append(fields, toon.Field{Key: "shared_work", Value: sharedRows})
 	}
@@ -494,6 +509,38 @@ func runObjectFieldWithKey(key string, rv runView) toon.Field {
 		fields = append(fields, toon.Field{Key: "active_steps", Value: activeRows})
 	}
 	return toon.Field{Key: key, Value: toon.NewObject(fields...)}
+}
+
+func (rv runView) attributionFields() []toon.Field {
+	if strings.TrimSpace(rv.AttributionJSON) == "" {
+		return nil
+	}
+	var rec types.AttributionRecord
+	if err := json.Unmarshal([]byte(rv.AttributionJSON), &rec); err != nil {
+		return []toon.Field{{Key: "status", Value: types.AttributionStatusUnavailable}, {Key: "note", Value: "attribution record could not be parsed; not a clean score"}}
+	}
+	fields := []toon.Field{
+		{Key: "status", Value: rec.Status},
+		{Key: "phase", Value: rec.Phase},
+		{Key: "original_worker", Value: rec.Counts.OriginalWorker},
+		{Key: "pipeline", Value: rec.Counts.Pipeline},
+		{Key: "pre_existing", Value: rec.Counts.PreExisting},
+		{Key: "unknown", Value: rec.Counts.Unknown},
+		{Key: "non_bugs", Value: rec.Counts.NonBugs},
+		{Key: "worker_tool", Value: rec.Worker.Tool},
+		{Key: "worker_model", Value: rec.Worker.Model},
+	}
+	if rec.BugFix != nil {
+		fields = append(fields, toon.Field{Key: "fixes_run", Value: rec.BugFix.OriginatingRunID})
+		fields = append(fields, toon.Field{Key: "bug_fix_confirmed", Value: rec.BugFix.Confirmed})
+	}
+	if rec.SubmittedHeadSHA != "" {
+		fields = append(fields, toon.Field{Key: "submitted_head", Value: rec.SubmittedHeadSHA})
+	}
+	if len(rec.EvidenceGaps) > 0 {
+		fields = append(fields, toon.Field{Key: "evidence_gaps", Value: rec.EvidenceGaps})
+	}
+	return fields
 }
 
 func (rv runView) automaticSkips() []automaticSkipRow {
